@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Socket.IO Multi-Room Group Chat Harness (4 users + attachments)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="container stack">
+    <h1>Socket.IO Multi-Room Group Chat Harness (4 users + attachments)</h1>
+
+    <!-- Server & socket controls -->
+    <div class="card">
+      <div class="row">
+        <span class="badge">Server</span>
+        <span class="muted small">Base URL</span>
+        <input id="serverUrl" placeholder="http://localhost:4000" style="flex:1" />
+        <span class="muted small">WS Path</span>
+        <input id="wsPath" value="/ws" style="width:120px" />
+        <button id="applyServer" class="ghost">Apply</button>
+      </div>
+      <div class="row small muted" style="margin-top:6px">
+        Leave server blank to use <code>window.location.origin</code>. Path must match your gateway (e.g. <code>/ws</code>).
+      </div>
+    </div>
+
+    <!-- Room manager -->
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <div class="row" style="gap:6px">
+          <span class="badge">Rooms</span>
+        </div>
+        <div class="row small muted" id="presence">A: — | B: — | C: — | D: —</div>
+      </div>
+
+      <div class="grid-two" style="margin-top:8px">
+        <!-- Create room -->
+        <div class="card">
+          <div class="row">
+            <input id="newRoomId" placeholder="room id (optional)" style="flex:1" />
+            <input id="newRoomName" placeholder="room name (optional)" style="flex:1" />
+            <button id="createRoom" class="primary">Create</button>
+          </div>
+          <div class="row small muted" style="margin-top:6px">
+            If ID is empty, the server generates one. Creator auto-joins.
+          </div>
+        </div>
+
+        <!-- Room list -->
+        <div class="card">
+          <div class="row"><span class="muted small">Available Rooms</span><button id="refreshRooms" class="ghost">Refresh</button></div>
+          <div id="roomList" class="list"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Four user panels -->
+    <div class="card">
+      <div class="grid-four">
+        <div>
+          <div class="row"><span class="badge">User A</span><span id="statusA" class="muted small">disconnected</span></div>
+          <label class="small muted">JWT (A)</label>
+          <textarea id="tokenA" rows="3" placeholder="paste JWT for A" style="width:100%"></textarea>
+          <div class="row" style="margin-top:8px">
+            <button id="connectA" class="primary">Connect</button>
+            <button id="disconnectA" class="ghost" disabled>Disconnect</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <span class="small muted">Active Room</span>
+            <select id="activeRoomA" style="flex:1"></select>
+          </div>
+          <div id="logsA" class="logs" style="margin-top:8px"></div>
+        </div>
+
+        <div>
+          <div class="row"><span class="badge">User B</span><span id="statusB" class="muted small">disconnected</span></div>
+          <label class="small muted">JWT (B)</label>
+          <textarea id="tokenB" rows="3" placeholder="paste JWT for B" style="width:100%"></textarea>
+          <div class="row" style="margin-top:8px">
+            <button id="connectB" class="primary">Connect</button>
+            <button id="disconnectB" class="ghost" disabled>Disconnect</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <span class="small muted">Active Room</span>
+            <select id="activeRoomB" style="flex:1"></select>
+          </div>
+          <div id="logsB" class="logs" style="margin-top:8px"></div>
+        </div>
+
+        <div>
+          <div class="row"><span class="badge">User C</span><span id="statusC" class="muted small">disconnected</span></div>
+          <label class="small muted">JWT (C)</label>
+          <textarea id="tokenC" rows="3" placeholder="paste JWT for C" style="width:100%"></textarea>
+          <div class="row" style="margin-top:8px">
+            <button id="connectC" class="primary">Connect</button>
+            <button id="disconnectC" class="ghost" disabled>Disconnect</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <span class="small muted">Active Room</span>
+            <select id="activeRoomC" style="flex:1"></select>
+          </div>
+          <div id="logsC" class="logs" style="margin-top:8px"></div>
+        </div>
+
+        <div>
+          <div class="row"><span class="badge">User D</span><span id="statusD" class="muted small">disconnected</span></div>
+          <label class="small muted">JWT (D)</label>
+          <textarea id="tokenD" rows="3" placeholder="paste JWT for D" style="width:100%"></textarea>
+          <div class="row" style="margin-top:8px">
+            <button id="connectD" class="primary">Connect</button>
+            <button id="disconnectD" class="ghost" disabled>Disconnect</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <span class="small muted">Active Room</span>
+            <select id="activeRoomD" style="flex:1"></select>
+          </div>
+          <div id="logsD" class="logs" style="margin-top:8px"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Per-user chat boxes -->
+    <div class="card">
+      <div id="roomsGrid" class="grid-four"></div>
+    </div>
+  </div>
+  <script src="./app.js"></script>
+</body>
+</html>
