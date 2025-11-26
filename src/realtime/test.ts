@@ -34,26 +34,18 @@ const roomKey = (id: string) => `conv:${id}`;
 const cryptoRandom = (): RoomId =>
   ('r_' + Math.random().toString(36).slice(2) + Date.now().toString(36)) as RoomId;
 
+/**
+ * Expected shape from Django ConversationDetailSerializer
+ * (only the fields we actually care about here).
+ *
+ * Adjust if your serializer changes.
+ */
 type DjangoConversation = {
   id: string;
   type: 'direct' | 'group' | 'channel' | 'post' | 'thread' | 'system';
   request_state?: 'none' | 'pending' | 'accepted' | 'rejected';
   request_initiator?: number | string | null;
   request_recipient?: number | string | null;
-};
-
-/**
- * This is the *wire* payload we expect from the client for `chat.send`.
- * It matches what you build in React Native in `sendOverNetwork`.
- */
-type ChatSendWirePayload = {
-  conversationId: string;
-  senderId?: string;            // we do NOT trust this, we use principal.userId
-  senderName?: string | null;
-  ciphertext?: string;          // text/plain for now; can be encrypted later
-  attachments?: any[];
-  replyToId?: string | null;
-  clientId?: string;
 };
 
 @WebSocketGateway({
@@ -66,7 +58,10 @@ export class ChatGateway
   private server!: Server;
   private readonly log = new Logger(ChatGateway.name);
 
+  /** In-memory rooms registry (swap to DB if needed). */
   private rooms = new Map<RoomId, RoomMeta>();
+
+  /** Track socket -> joined rooms. */
   private memberships = new Map<string, Set<RoomId>>();
 
   constructor(
@@ -82,38 +77,21 @@ export class ChatGateway
     this.server = server;
     this.log.log('Gateway initialized');
 
+    // Handshake auth — sets socket.principal AND preserves raw token
     this.server.use(async (socket: Socket, next) => {
-      this.log.debug(
-        `Handshake middleware: socket.id=${socket.id}, headers.authorization=${socket.handshake?.headers?.authorization}`,
-      );
-
       try {
         const header = socket?.handshake?.headers?.authorization as string | undefined;
         const bearer = header?.startsWith('Bearer ') ? header.slice(7) : undefined;
         const token =
           (socket.handshake.auth?.token as string | undefined) || bearer;
+        if (!token) return next(new Error('Unauthorized: missing token'));
 
-        if (!token) {
-          this.log.warn(`Handshake failed: missing token for socket ${socket.id}`);
-          return next(new Error('Unauthorized: missing token'));
-        }
-
-        this.log.debug(`Introspecting token for socket ${socket.id}`);
         const principal = await this.auth.introspect(token);
-
-        this.log.debug(
-          `Introspection OK for socket ${socket.id}, userId=${(principal as any).userId}`,
-        );
         (socket as any).principal = principal as Principal;
-        (socket as any).token = token;
-
+        (socket as any).token = token; // used for Django API calls
         return next();
       } catch (err) {
-        this.log.warn(
-          `auth error for socket ${socket.id}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
+        this.log.warn(`auth error: ${err instanceof Error ? err.message : String(err)}`);
         return next(new Error('Unauthorized: invalid token'));
       }
     });
@@ -121,41 +99,24 @@ export class ChatGateway
 
   async handleConnection(client: Socket) {
     const p = (client as any).principal as Principal | undefined;
-    this.log.log(
-      `handleConnection: socket.id=${client.id}, principal=${p ? JSON.stringify(p) : 'null'}`,
-    );
-
     if (!p) {
       this.log.warn(`connection without principal, disconnecting ${client.id}`);
       client.disconnect(true);
       return;
     }
-
     this.memberships.set(client.id, new Set());
     await this.presence.markOnline(p.userId, client.id);
     this.log.log(`connected user=${p.userId} socket=${client.id}`);
 
-    const roomsPayload = this.roomListPayload();
-    this.log.debug(
-      `Emitting rooms.update to socket=${client.id}, roomsCount=${roomsPayload.length}`,
-    );
-    client.emit('rooms.update', roomsPayload);
+    // Send current rooms to the client on connect
+    client.emit('rooms.update', this.roomListPayload());
   }
 
   async handleDisconnect(client: Socket) {
     const p = (client as any).principal as Principal | undefined;
-    this.log.log(
-      `handleDisconnect: socket.id=${client.id}, user=${p?.userId ?? 'anon'}`,
-    );
-
     this.memberships.delete(client.id);
-
-    if (p) {
-      await this.presence.markOffline(p.userId, client.id);
-      this.log.debug(
-        `Marked user=${p.userId} offline for socket=${client.id} (may still have other sockets)`,
-      );
-    }
+    if (p) await this.presence.markOffline(p.userId, client.id);
+    this.log.log(`disconnected user=${p?.userId ?? 'anon'} socket=${client.id}`);
   }
 
   private displayName(p: Principal) {
@@ -163,15 +124,11 @@ export class ChatGateway
   }
 
   private roomListPayload() {
-    const list = [...this.rooms.values()].sort((a, b) => b.createdAt - a.createdAt);
-    this.log.debug(`roomListPayload: count=${list.length}`);
-    return list;
+    return [...this.rooms.values()].sort((a, b) => b.createdAt - a.createdAt);
   }
 
   private broadcastRooms() {
-    const payload = this.roomListPayload();
-    this.log.debug(`broadcastRooms: broadcasting ${payload.length} rooms`);
-    this.server.emit('rooms.update', payload);
+    this.server.emit('rooms.update', this.roomListPayload());
   }
 
   // ---------------- Django integration for DM request policy ----------------
@@ -179,29 +136,26 @@ export class ChatGateway
   private get djangoBaseUrl() {
     const base = process.env.DJANGO_BASE_URL;
     if (!base) {
-      this.log.error('DJANGO_BASE_URL env var is not set');
       throw new Error('DJANGO_BASE_URL env var is not set');
     }
-    return base.replace(/\/+$/, '');
+    return base.replace(/\/+$/, ''); // trim trailing slash
   }
 
+  /**
+   * Fetch a conversation from Django using the current user's JWT,
+   * so Django will check membership and permissions for us.
+   */
   private async fetchConversationFromDjango(
     socket: Socket,
     conversationId: string,
   ): Promise<DjangoConversation | null> {
     const token = (socket as any).token as string | undefined;
     if (!token) {
-      this.log.warn(
-        `fetchConversationFromDjango: missing token on socket ${socket.id} for conv=${conversationId}`,
-      );
+      this.log.warn('fetchConversationFromDjango: missing token on socket');
       return null;
     }
 
-    const url = `${this.djangoBaseUrl}/api/v1/conversations/${conversationId}/`;
-    this.log.debug(
-      `fetchConversationFromDjango: GET ${url} for socket=${socket.id}`,
-    );
-
+    const url = `${this.djangoBaseUrl}/api/chat/conversations/${conversationId}/`;
     try {
       const res = await firstValueFrom(
         this.http.get(url, {
@@ -209,12 +163,6 @@ export class ChatGateway
             Authorization: `Bearer ${token}`,
           },
         }),
-      );
-
-      this.log.debug(
-        `fetchConversationFromDjango OK conv=${conversationId}, data=${JSON.stringify(
-          res.data,
-        )}`,
       );
       return res.data as DjangoConversation;
     } catch (err) {
@@ -227,23 +175,18 @@ export class ChatGateway
     }
   }
 
+  /**
+   * Auto-accepts a pending DM request when the recipient sends a message,
+   * by calling the Django `accept-request` action.
+   */
   private async acceptDmRequestOnDjango(
     socket: Socket,
     conversationId: string,
   ): Promise<void> {
     const token = (socket as any).token as string | undefined;
-    if (!token) {
-      this.log.warn(
-        `acceptDmRequestOnDjango: missing token on socket ${socket.id} for conv=${conversationId}`,
-      );
-      return;
-    }
+    if (!token) return;
 
     const url = `${this.djangoBaseUrl}/api/chat/conversations/${conversationId}/accept-request/`;
-    this.log.debug(
-      `acceptDmRequestOnDjango: POST ${url} for socket=${socket.id}`,
-    );
-
     try {
       await firstValueFrom(
         this.http.post(
@@ -256,9 +199,6 @@ export class ChatGateway
           },
         ),
       );
-      this.log.debug(
-        `acceptDmRequestOnDjango OK for conv=${conversationId} (auto-accepted)`,
-      );
     } catch (err) {
       this.log.warn(
         `acceptDmRequestOnDjango failed for conv=${conversationId}: ${
@@ -267,113 +207,68 @@ export class ChatGateway
       );
     }
   }
+
+  /**
+   * Enforce the DM request rules:
+   *
+   * - Non-direct or request_state NONE/ACCEPTED → allowed.
+   * - PENDING:
+   *    - Initiator: BLOCK (they already sent first message).
+   *    - Recipient: allowed, and we auto-accept on Django.
+   * - REJECTED: BLOCK.
+   */
   private async canUserSendInConversation(
     socket: Socket,
     conversationId: string,
     userId: string,
   ): Promise<{ ok: boolean; error?: string }> {
-    this.log.debug(
-      `canUserSendInConversation: socket=${socket.id}, userId=${userId}, conv=${conversationId}`,
-    );
-
     const conv = await this.fetchConversationFromDjango(socket, conversationId);
-
-    // 🔴 KEY CHANGE:
-    // If Django returns 404 / any error (conv === null),
-    // we can either block (STRICT) or allow (default dev).
     if (!conv) {
-      const strict = process.env.CHAT_DM_POLICY_STRICT === '1';
+      return { ok: false, error: 'conversation_not_found_or_not_accessible' };
+    }
 
-      if (strict) {
-        this.log.debug(
-          `canUserSendInConversation: conv not found / not accessible for conv=${conversationId} (STRICT mode → block)`,
-        );
-        return {
-          ok: false,
-          error: 'conversation_not_found_or_not_accessible',
-        };
-      }
-
-      this.log.warn(
-        `canUserSendInConversation: conv=${conversationId} not found, but STRICT mode is OFF → allowing send.`,
-      );
+    // Normal groups/channels, or no request workflow
+    if (conv.type !== 'direct' || !conv.request_state || conv.request_state === 'none') {
       return { ok: true };
     }
 
-    this.log.debug(
-      `canUserSendInConversation: conv=${conversationId}, type=${conv.type}, request_state=${conv.request_state}`,
-    );
-
-    // For non-direct conversations, we don't enforce DM request policy
-    if (conv.type !== 'direct') {
-      this.log.debug(
-        `canUserSendInConversation: conv=${conversationId} is type=${conv.type}, sending allowed (no DM lock).`,
-      );
-      return { ok: true };
-    }
-
-    // For direct DMs: if there's no request_state or it's 'none', allow.
-    if (!conv.request_state || conv.request_state === 'none') {
-      this.log.debug(
-        `canUserSendInConversation: direct conv=${conversationId} with request_state=${conv.request_state}, allowed.`,
-      );
-      return { ok: true };
-    }
-
-    const initiatorId =
-      conv.request_initiator != null ? String(conv.request_initiator) : null;
-    const recipientId =
-      conv.request_recipient != null ? String(conv.request_recipient) : null;
+    const initiatorId = conv.request_initiator != null ? String(conv.request_initiator) : null;
+    const recipientId = conv.request_recipient != null ? String(conv.request_recipient) : null;
     const userIdStr = String(userId);
 
-    this.log.debug(
-      `canUserSendInConversation: userId=${userIdStr}, initiator=${initiatorId}, recipient=${recipientId}`,
-    );
-
+    // If user is not initiator or recipient, block.
     if (userIdStr !== initiatorId && userIdStr !== recipientId) {
-      this.log.debug(
-        `canUserSendInConversation: user=${userIdStr} is not participant for conv=${conversationId}`,
-      );
       return { ok: false, error: 'not_participant' };
     }
 
     if (conv.request_state === 'pending') {
       if (userIdStr === initiatorId) {
-        this.log.debug(
-          `canUserSendInConversation: initiator is blocked for pending conv=${conversationId}`,
-        );
+        // Sender already used their "first message"; further sends are blocked
         return { ok: false, error: 'pending_request_sender_blocked' };
       }
       if (userIdStr === recipientId) {
-        this.log.debug(
-          `canUserSendInConversation: recipient sending in pending conv=${conversationId}, triggering auto-accept`,
-        );
+        // Recipient sending → treat as auto-accept
         await this.acceptDmRequestOnDjango(socket, conversationId);
         return { ok: true };
       }
     }
 
     if (conv.request_state === 'accepted') {
-      this.log.debug(
-        `canUserSendInConversation: conv=${conversationId} accepted, sending allowed`,
-      );
       return { ok: true };
     }
 
     if (conv.request_state === 'rejected') {
-      this.log.debug(
-        `canUserSendInConversation: conv=${conversationId} rejected, sending blocked`,
-      );
       return { ok: false, error: 'request_rejected' };
     }
 
-    this.log.debug(
-      `canUserSendInConversation: conv=${conversationId} unknown state=${conv.request_state}, blocking`,
-    );
+    // Fallback: be safe and block
     return { ok: false, error: 'forbidden' };
   }
 
-
+  /**
+   * Map internal policy error codes to user-friendly messages
+   * that we send back to the sender as a system notice.
+   */
   private mapPolicyErrorToMessage(code?: string): string {
     switch (code) {
       case 'pending_request_sender_blocked':
@@ -396,7 +291,6 @@ export class ChatGateway
   @UseGuards(WsAuthGuard)
   @SubscribeMessage('room.list')
   handleListRooms(@ConnectedSocket() client: Socket) {
-    this.log.debug(`room.list from socket=${client.id}`);
     client.emit('rooms.update', this.roomListPayload());
   }
 
@@ -407,27 +301,17 @@ export class ChatGateway
     @MessageBody() body: { roomId?: RoomId; name?: string },
   ) {
     const p = (client as any).principal as Principal;
-    this.log.debug(
-      `room.create by user=${p.userId}, socket=${client.id}, body=${JSON.stringify(body)}`,
-    );
 
     const rid: RoomId = (body?.roomId || cryptoRandom()) as RoomId;
     if (!this.rooms.has(rid)) {
       this.rooms.set(rid, { id: rid, name: body?.name, createdAt: Date.now() });
       this.log.log(`room created id=${rid} by user=${p.userId}`);
-    } else {
-      this.log.debug(`room.create: room id=${rid} already exists`);
     }
 
+    // Auto-join creator
     client.join(roomKey(rid));
     if (!this.memberships.get(client.id)) this.memberships.set(client.id, new Set());
     this.memberships.get(client.id)!.add(rid);
-
-    this.log.debug(
-      `room.create: socket=${client.id} joined room=${rid}, membership=${Array.from(
-        this.memberships.get(client.id)!,
-      )}`,
-    );
 
     client.emit('room.created', { id: rid, name: body?.name });
     this.broadcastRooms();
@@ -439,21 +323,14 @@ export class ChatGateway
     @ConnectedSocket() client: Socket,
     @MessageBody() body: { conversationId: RoomId },
   ) {
-    this.log.debug(
-      `chat.join from socket=${client.id}, body=${JSON.stringify(body)}`,
-    );
-
     if (!body?.conversationId) {
-      this.log.warn(`chat.join: conversationId missing for socket=${client.id}`);
       return { ok: false, error: 'conversationId_required' };
     }
     const rid = body.conversationId;
 
+    // Optional: allow ad-hoc rooms
     if (!this.rooms.has(rid)) {
       this.rooms.set(rid, { id: rid, createdAt: Date.now() });
-      this.log.log(
-        `chat.join: created in-memory room for conv=${rid} (ad-hoc / Django conv)`,
-      );
       this.broadcastRooms();
     }
 
@@ -462,12 +339,6 @@ export class ChatGateway
     this.memberships.get(client.id)!.add(rid);
 
     this.log.log(`socket=${client.id} joined room=${rid}`);
-    this.log.debug(
-      `chat.join: memberships for socket=${client.id} => ${JSON.stringify(
-        Array.from(this.memberships.get(client.id)!),
-      )}`,
-    );
-
     client.emit('chat.joined', { conversationId: rid });
     return { ok: true };
   }
@@ -478,25 +349,13 @@ export class ChatGateway
     @ConnectedSocket() client: Socket,
     @MessageBody() body: { conversationId: RoomId },
   ) {
-    this.log.debug(
-      `chat.leave from socket=${client.id}, body=${JSON.stringify(body)}`,
-    );
-
     if (!body?.conversationId) {
-      this.log.warn(`chat.leave: conversationId missing for socket=${client.id}`);
       return { ok: false, error: 'conversationId_required' };
     }
-
     client.leave(roomKey(body.conversationId));
     this.memberships.get(client.id)?.delete(body.conversationId);
 
     this.log.log(`socket=${client.id} left room=${body.conversationId}`);
-    this.log.debug(
-      `chat.leave: memberships for socket=${client.id} => ${JSON.stringify(
-        Array.from(this.memberships.get(client.id) ?? []),
-      )}`,
-    );
-
     client.emit('chat.left', { conversationId: body.conversationId });
     return { ok: true };
   }
@@ -507,80 +366,39 @@ export class ChatGateway
   @SubscribeMessage('chat.send')
   async send(
     @ConnectedSocket() client: Socket,
-    @MessageBody() body: ChatSendWirePayload,
+    @MessageBody() dto: SendMessageDto & { clientId?: string; senderName?: string },
   ) {
     const p = (client as any).principal as Principal;
-
-    this.log.debug(
-      `chat.send from socket=${client.id}, user=${p.userId}, dto=${JSON.stringify({
-        ...body,
-        ciphertextPreview: body?.ciphertext
-          ? body.ciphertext.slice(0, 20) + '...'
-          : null,
-      })}`,
-    );
-
-    if (!body?.conversationId) {
-      this.log.warn(
-        `chat.send: missing conversationId from user=${p.userId}, socket=${client.id}`,
-      );
+    if (!dto?.conversationId) {
       return { ok: false, error: 'conversationId_required' };
     }
 
-    const ciphertext = (body.ciphertext ?? '').trim();
-    if (!ciphertext) {
-      this.log.warn(
-        `chat.send: empty ciphertext from user=${p.userId}, conv=${body.conversationId}`,
-      );
-      return { ok: false, error: 'empty_message' };
-    }
-
+    // Only allow sending if this socket joined the room
     const joined = this.memberships.get(client.id);
-    if (!joined?.has(body.conversationId)) {
-      this.log.warn(
-        `chat.send: user=${p.userId} socket=${client.id} tried to send to conv=${body.conversationId} but is NOT joined`,
-      );
-      const message = this.mapPolicyErrorToMessage('not_joined_to_conversation');
-      client.emit('chat.system', {
-        kind: 'dm_request_block',
-        conversationId: body.conversationId,
-        code: 'not_joined_to_conversation',
-        message,
-      });
-      return { ok: false, error: 'not_joined_to_conversation', message };
+    if (!joined?.has(dto.conversationId)) {
+      return { ok: false, error: 'not_joined_to_conversation' };
     }
 
-    this.log.debug(
-      `chat.send: user=${p.userId} socket=${client.id} is joined to conv=${body.conversationId}, running DM policy check`,
-    );
-
+    // DM request / lock policy check via Django
     const policy = await this.canUserSendInConversation(
       client,
-      body.conversationId,
+      dto.conversationId,
       p.userId,
-    );
-
-    this.log.debug(
-      `chat.send: policy result for user=${p.userId} conv=${body.conversationId} => ${JSON.stringify(
-        policy,
-      )}`,
     );
 
     if (!policy.ok) {
       const code = policy.error ?? 'forbidden';
       const humanMessage = this.mapPolicyErrorToMessage(code);
 
-      this.log.warn(
-        `chat.send: blocked by policy. user=${p.userId}, conv=${body.conversationId}, code=${code}, message=${humanMessage}`,
-      );
-
+      // 🔔 Send a "system" event back to the SENDER ONLY
       client.emit('chat.system', {
         kind: 'dm_request_block',
-        conversationId: body.conversationId,
+        conversationId: dto.conversationId,
         code,
         message: humanMessage,
       });
 
+      // Ack with detailed info for client logic
       return {
         ok: false,
         error: code,
@@ -588,91 +406,33 @@ export class ChatGateway
       };
     }
 
-    this.log.debug(
-      `chat.send: policy OK for user=${p.userId}, conv=${body.conversationId}. Saving message to DB...`,
-    );
+    // ✅ Allowed → Persist message to Mongo via MessagesService
+    const msg = await this.messages.save(p.userId, dto);
 
-    // 🔹 Normalize into the DTO we expect in the messages service / Mongo
-    const dto: SendMessageDto & { clientId?: string; senderName?: string | null } = {
-      conversationId: body.conversationId,
-      ciphertext,
-      attachments: body.attachments ?? [],
-      replyToId: body.replyToId ?? null,
-      // extra metadata (not necessarily persisted)
-      clientId: body.clientId,
-      senderName: body.senderName ?? null,
-    } as any;
-
-    let msg;
-    try {
-      msg = await this.messages.save(p.userId, dto);
-    } catch (err) {
-      this.log.error(
-        `chat.send: error while saving message for user=${p.userId}, conv=${body.conversationId}: ${
-          err instanceof Error ? err.stack || err.message : String(err)
-        }`,
-      );
-      return { ok: false, error: 'db_error' };
-    }
-
-    this.log.debug(
-      `chat.send: message saved to DB. id=${msg.id}, conv=${msg.conversationId}, sender=${msg.senderId}, createdAt=${msg.createdAt}`,
-    );
-
+    // Broadcast to the room (with clientId & senderName to help client dedupe & styling)
     const payload = {
       id: msg.id,
-      clientId: body.clientId,
+      clientId: dto.clientId,
       conversationId: msg.conversationId,
       senderId: msg.senderId,
-      senderName: body.senderName || this.displayName(p),
+      senderName: dto.senderName || this.displayName(p),
       ciphertext: msg.ciphertext,
       attachments: msg.attachments ?? [],
       createdAt: msg.createdAt,
       replyToId: msg.replyToId,
     };
 
-    this.log.debug(
-      `chat.send: broadcasting chat.message to room=${roomKey(
-        body.conversationId,
-      )}, payloadSummary=${JSON.stringify({
-        id: payload.id,
-        clientId: payload.clientId,
-        senderId: payload.senderId,
-        conversationId: payload.conversationId,
-        createdAt: payload.createdAt,
-        hasAttachments: !!(payload.attachments && payload.attachments.length),
-      })}`,
-    );
-
-    this.server.to(roomKey(body.conversationId)).emit('chat.message', payload);
-
-    this.log.debug(
-      `chat.send: ACK success to user=${p.userId}, msgId=${msg.id}, conv=${body.conversationId}`,
-    );
+    this.server.to(roomKey(dto.conversationId)).emit('chat.message', payload);
     return { ok: true, id: msg.id };
   }
 
   @UseGuards(WsAuthGuard)
   @SubscribeMessage('chat.history')
   async history(@MessageBody() body: { conversationId: RoomId; limit?: number }) {
-    this.log.debug(`chat.history requested for conv=${body?.conversationId}`);
-
     if (!body?.conversationId) {
-      this.log.warn('chat.history: conversationId missing');
       return { ok: false, error: 'conversationId_required' };
     }
-
-    const limit = body.limit ?? 30;
-    this.log.debug(
-      `chat.history: loading last ${limit} messages for conv=${body.conversationId}`,
-    );
-
-    const items = await this.messages.history(body.conversationId, limit);
-
-    this.log.debug(
-      `chat.history: loaded ${items.length} messages for conv=${body.conversationId}`,
-    );
-
+    const items = await this.messages.history(body.conversationId, body.limit ?? 30);
     return items.map((m) => ({
       id: m.id,
       conversationId: m.conversationId,
@@ -694,17 +454,9 @@ export class ChatGateway
     body: { conversationId: RoomId; isTyping: boolean; senderName?: string },
   ) {
     const p = (client as any).principal as Principal;
-    this.log.debug(
-      `typing event from user=${p.userId}, socket=${client.id}, body=${JSON.stringify(
-        body,
-      )}`,
-    );
+    if (!body?.conversationId) return;
 
-    if (!body?.conversationId) {
-      this.log.warn(`typing: missing conversationId from socket=${client.id}`);
-      return;
-    }
-
+    // Emit to others in the room only
     client.to(roomKey(body.conversationId)).emit('typing', {
       conversationId: body.conversationId,
       isTyping: !!body.isTyping,
@@ -712,6 +464,7 @@ export class ChatGateway
     });
   }
 
+  // Back-compat → unified 'typing'
   @UseGuards(WsAuthGuard)
   @SubscribeMessage('typing.start')
   typingStart(
@@ -719,17 +472,7 @@ export class ChatGateway
     @MessageBody() body: { conversationId: RoomId },
   ) {
     const p = (client as any).principal as Principal;
-    this.log.debug(
-      `typing.start from user=${p.userId}, socket=${client.id}, body=${JSON.stringify(
-        body,
-      )}`,
-    );
-
-    if (!body?.conversationId) {
-      this.log.warn(`typing.start: missing conversationId from socket=${client.id}`);
-      return;
-    }
-
+    if (!body?.conversationId) return;
     client.to(roomKey(body.conversationId)).emit('typing', {
       conversationId: body.conversationId,
       isTyping: true,
@@ -744,17 +487,7 @@ export class ChatGateway
     @MessageBody() body: { conversationId: RoomId },
   ) {
     const p = (client as any).principal as Principal;
-    this.log.debug(
-      `typing.stop from user=${p.userId}, socket=${client.id}, body=${JSON.stringify(
-        body,
-      )}`,
-    );
-
-    if (!body?.conversationId) {
-      this.log.warn(`typing.stop: missing conversationId from socket=${client.id}`);
-      return;
-    }
-
+    if (!body?.conversationId) return;
     client.to(roomKey(body.conversationId)).emit('typing', {
       conversationId: body.conversationId,
       isTyping: false,
