@@ -1,5 +1,9 @@
+// src/messages/messages.module.ts
+
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
+import { HttpModule } from '@nestjs/axios';
+
 import { MessagesService } from './messages.service';
 import { MessageEntity, MessageSchema } from './schemas/message.schema';
 
@@ -8,6 +12,7 @@ import { MessageEntity, MessageSchema } from './schemas/message.schema';
     MongooseModule.forFeature([
       { name: MessageEntity.name, schema: MessageSchema },
     ]),
+    HttpModule,
   ],
   providers: [MessagesService],
   exports: [MessagesService],
