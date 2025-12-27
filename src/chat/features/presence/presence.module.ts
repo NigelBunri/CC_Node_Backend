@@ -1,9 +1,8 @@
-// src/chat/features/presence/presence.module.ts
 import { Module } from '@nestjs/common';
-import { PresenceModule as RootPresenceModule } from 'src/presence/presence.module';
+import { PresenceService } from './presence.service';
 
 @Module({
-  imports: [RootPresenceModule],
-  exports: [RootPresenceModule],
+  providers: [PresenceService],
+  exports: [PresenceService], // ✅ required so other modules can inject it
 })
 export class PresenceModule {}

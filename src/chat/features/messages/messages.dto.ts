@@ -1,80 +1,184 @@
 // src/chat/features/messages/messages.dto.ts
 
-import { MessageKind } from "src/chat/features/messages/schemas/message.schema";
+import {
+  IsArray,
+  IsBoolean,
+  IsIn,
+  IsInt,
+  IsNumber,
+  IsObject,
+  IsOptional,
+  IsString,
+  Max,
+  Min,
+  ValidateNested,
+  ArrayMaxSize,
+} from 'class-validator';
+import { Type } from 'class-transformer';
+import type { MessageKind } from '../../chat.types';
 
-export type SendPayload = {
-  conversationId: string;
-  clientId: string;
-  kind: MessageKind;
+export class AttachmentDto {
+  @IsString() id!: string;
+  @IsString() url!: string;
 
-  // E2EE friendly
-  ciphertext?: string;
-  encryptionMeta?: Record<string, any>;
+  @IsString() originalName!: string;
+  @IsString() mimeType!: string;
 
-  // Non-E2EE fallback
+  @IsInt() @Min(0) size!: number;
+
+  @IsOptional() @IsString() kind?: string;
+
+  @IsOptional() @IsInt() @Min(0) width?: number;
+  @IsOptional() @IsInt() @Min(0) height?: number;
+  @IsOptional() @IsInt() @Min(0) durationMs?: number;
+  @IsOptional() @IsString() thumbUrl?: string;
+}
+
+export class StyledTextDto {
+  @IsString() text!: string;
+
+  @IsString() backgroundColor!: string;
+
+  @IsInt() @Min(10) @Max(120)
+  fontSize!: number;
+
+  @IsString() fontColor!: string;
+
+  @IsOptional() @IsString()
+  fontFamily?: string;
+}
+
+export class VoiceDto {
+  @IsInt() @Min(1) @Max(60 * 60 * 1000)
+  durationMs!: number;
+}
+
+export class StickerDto {
+  @IsString() id!: string;
+  @IsString() uri!: string;
+
+  @IsOptional() @IsString() text?: string;
+  @IsOptional() @IsInt() @Min(0) width?: number;
+  @IsOptional() @IsInt() @Min(0) height?: number;
+}
+
+export class ContactDto {
+  @IsString() id!: string;
+  @IsString() name!: string;
+  @IsString() phone!: string;
+}
+
+export class PollOptionDto {
+  @IsString() id!: string;
+  @IsString() text!: string;
+
+  @IsOptional() @IsInt() @Min(0)
+  votes?: number;
+}
+
+export class PollDto {
+  @IsOptional() @IsString()
+  id?: string;
+
+  @IsString() question!: string;
+
+  @IsArray()
+  @ArrayMaxSize(20)
+  @ValidateNested({ each: true })
+  @Type(() => PollOptionDto)
+  options!: PollOptionDto[];
+
+  @IsOptional() @IsBoolean()
+  allowMultiple?: boolean;
+
+  @IsOptional() @IsString()
+  expiresAt?: string | null;
+}
+
+export class EventDto {
+  @IsOptional() @IsString()
+  id?: string;
+
+  @IsString() title!: string;
+
+  @IsOptional() @IsString()
+  description?: string;
+
+  @IsOptional() @IsString()
+  location?: string;
+
+  @IsString() startsAt!: string;
+
+  @IsOptional() @IsString()
+  endsAt?: string;
+}
+
+export class SendMessageDto {
+  @IsString() conversationId!: string;
+  @IsString() clientId!: string;
+
+  @IsIn([
+    'text',
+    'voice',
+    'styled_text',
+    'sticker',
+    'system',
+    'contacts',
+    'poll',
+    'event',
+  ] satisfies MessageKind[])
+  kind!: MessageKind;
+
+  // Plain text
+  @IsOptional() @IsString()
   text?: string;
 
-  attachments?: Array<{
-    id: string;
-    type: string;
-    mime?: string;
-    name?: string;
-    size?: number;
-    width?: number;
-    height?: number;
-    durationMs?: number;
-    sha256?: string;
-    thumbnailId?: string;
-    extra?: Record<string, any>;
-  }>;
+  // Styled text
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => StyledTextDto)
+  styledText?: StyledTextDto;
 
-  reply?: {
-    toMessageId?: string;
-    toSeq?: number;
-    toUserId?: string;
-    previewText?: string;
-  };
+  // Voice metadata
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => VoiceDto)
+  voice?: VoiceDto;
 
-  forward?: {
-    isForwarded?: boolean;
-    forwardCount?: number;
-    originalMessageId?: string;
-    originalConversationId?: string;
-  };
+  // Sticker payload
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => StickerDto)
+  sticker?: StickerDto;
 
-  mentions?: { userIds?: string[] };
+  // Attachments
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(20)
+  @ValidateNested({ each: true })
+  @Type(() => AttachmentDto)
+  attachments?: AttachmentDto[];
 
-  ephemeral?: {
-    enabled?: boolean;
-    ttlSeconds?: number;
-    startAfterRead?: boolean;
-  };
+  // Contacts
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(50)
+  @ValidateNested({ each: true })
+  @Type(() => ContactDto)
+  contacts?: ContactDto[];
 
-  linkPreview?: {
-    url?: string;
-    title?: string;
-    description?: string;
-    imageUrl?: string;
-  };
+  // Poll
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => PollDto)
+  poll?: PollDto;
 
-  poll?: {
-    question?: string;
-    options?: string[];
-    multiple?: boolean;
-  };
-};
+  // Event
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => EventDto)
+  event?: EventDto;
 
-export type EditPayload = {
-  conversationId: string;
-  messageId: string;
-  ciphertext?: string;
-  encryptionMeta?: Record<string, any>;
-  text?: string;
-  attachments?: SendPayload['attachments'];
-};
-
-export type DeletePayload = {
-  conversationId: string;
-  messageId: string;
-  mode: 'deleted_for_me' | 'deleted_for_everyone';
-};
+  @IsOptional() @IsString()
+  replyToId?: string;
+}

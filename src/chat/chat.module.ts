@@ -1,14 +1,18 @@
+// src/chat/chat.module.ts
+
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 
-import { DjangoAuthService } from '../auth/django-auth.service';
+import { AuthModule } from '../auth/auth.module';
 import { WsAuthGuard } from '../auth/ws-auth.guard';
 
 import { Message, MessageSchema } from './features/messages/schemas/message.schema';
 
-import { ReceiptsService } from '../chat/features/receipts/receipts.service';
-import { ReactionsService } from '../chat/features/reactions/reactions.service';
-import { SyncService } from '../chat/features/sync/sync.service';
+import { MessagesService } from './features/messages/messages.service';
+import { ReactionsService } from './features/reactions/reactions.service';
+import { ReceiptsService } from './features/receipts/receipts.service';
+import { SyncService } from './features/sync/sync.service';
+import { PresenceService } from './features/presence/presence.service';
 
 import { DjangoConversationClient } from './integrations/django/django-conversation.client';
 import { DjangoSeqClient } from './integrations/django/django-seq.client';
@@ -16,29 +20,43 @@ import { DjangoSeqClient } from './integrations/django/django-seq.client';
 import { RateLimitService } from './infra/rate-limit/rate-limit.service';
 
 import { ChatGateway } from '../realtime/chat.gateway';
-import { PresenceService } from '../chat/features/presence/presence.service';
-import { MessagesService } from '../chat/features/messages/messages.service';
+
+// ✅ Batch B modules (they export their services AND include their own Mongoose models)
+import { ThreadsModule } from './features/threads/threads.module';
+import { PinsModule } from './features/pins/pins.module';
+import { StarsModule } from './features/stars/stars.module';
+import { ModerationModule } from './features/moderation/moderation.module';
+import { CallStateModule } from './features/calls/call-state.module';
 
 @Module({
   imports: [
+    AuthModule,
+
+    // Batch A message model
     MongooseModule.forFeature([{ name: Message.name, schema: MessageSchema }]),
+
+    // ✅ Batch B feature modules
+    ThreadsModule,
+    PinsModule,
+    StarsModule,
+    ModerationModule,
+    CallStateModule,
   ],
   providers: [
+    // Gateway + guard
     ChatGateway,
-
-    DjangoAuthService,
     WsAuthGuard,
 
+    // Batch A services
     MessagesService,
-    ReceiptsService,
     ReactionsService,
+    ReceiptsService,
     SyncService,
-
     PresenceService,
 
+    // Django integrations + infra
     DjangoConversationClient,
     DjangoSeqClient,
-
     RateLimitService,
   ],
 })

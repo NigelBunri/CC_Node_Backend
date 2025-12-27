@@ -1,64 +1,42 @@
 // src/chat/integrations/django/django-conversation.client.ts
-import { Injectable, ForbiddenException } from '@nestjs/common';
-import axios from 'axios';
-import https from 'https';
-import { ConversationPermission } from '../../chat.types';
 
-/**
- * DjangoConversationClient
- *
- * Purpose:
- * - Membership/blocked/role checks for a conversation.
- * - Keeps ChatGateway/services clean.
- *
- * You MUST wire this to your Django API.
- *
- * Environment variables (example):
- * - DJANGO_CONV_PERMS_URL="https://django/api/chat/conversations/{conversationId}/ws-perms/"
- * - DJANGO_INTERNAL_TOKEN="..."
- * - DJANGO_TLS_INSECURE="1" (optional dev only)
- */
+import { Injectable, UnauthorizedException } from '@nestjs/common';
+import axios from 'axios';
+import { ConversationPermission, SocketPrincipal } from '../../chat.types';
+
 function ensureTrailingSlash(u: string) {
   return u.endsWith('/') ? u : u + '/';
 }
 
 @Injectable()
 export class DjangoConversationClient {
-  async assertConversationMemberOrThrow(userId: string, conversationId: string): Promise<ConversationPermission> {
-    const raw = process.env.DJANGO_CONV_PERMS_URL;
-    if (!raw) {
-      // Hard-fail if you prefer; for now, assume allowed in dev.
-      return { isMember: true, isBlocked: false, role: 'member' };
-    }
-
-    const url = ensureTrailingSlash(raw.replace('{conversationId}', encodeURIComponent(conversationId)));
+  async assertConversationMemberOrThrow(userId: string, conversationId: string) {
     const internal = process.env.DJANGO_INTERNAL_TOKEN!;
-    const allowSelfSigned = (process.env.DJANGO_TLS_INSECURE ?? '0') === '1';
-
-    const httpsAgent = url.startsWith('https')
-      ? new https.Agent({ rejectUnauthorized: !allowSelfSigned })
-      : undefined;
+    const rawUrl = process.env.DJANGO_CONV_PERMS_URL!;
+    const url = ensureTrailingSlash(rawUrl).replace('{conversationId}', conversationId);
 
     const { data } = await axios.get(url, {
-      params: { userId },
-      headers: {
-        'X-Internal-Auth': internal,
-        Accept: 'application/json',
-      },
+      headers: { 'X-Internal-Auth': internal, Accept: 'application/json', 'X-User-Id': userId },
       timeout: 4000,
-      httpsAgent,
     });
 
-    const perm: ConversationPermission = {
-      isMember: !!data?.isMember,
-      isBlocked: !!data?.isBlocked,
-      role: (data?.role as any) ?? 'member',
-      scopes: Array.isArray(data?.scopes) ? data.scopes : undefined,
-    };
+    // Accept either {isMember:true} or Django-like payload
+    const isMember = Boolean(data?.isMember ?? data?.member ?? data?.ok);
+    const isBlocked = Boolean(data?.isBlocked ?? data?.blocked);
+    const dmState = (data?.dmState ?? data?.dm_state) as ConversationPermission['dmState'] | undefined;
 
-    if (!perm.isMember) throw new ForbiddenException('Not a conversation member');
-    if (perm.isBlocked) throw new ForbiddenException('You are blocked from this conversation');
+    if (!isMember || isBlocked || dmState === 'pending') {
+      throw new UnauthorizedException('Not allowed');
+    }
+  }
 
-    return perm;
+  // ✅ handlers/messages.ts expects wsPerms(...)
+  async wsPerms(conversationId: string, principal: SocketPrincipal): Promise<ConversationPermission> {
+    try {
+      await this.assertConversationMemberOrThrow(principal.userId, conversationId);
+      return { isMember: true, isBlocked: false, dmState: 'accepted', scopes: principal.scopes };
+    } catch {
+      return { isMember: false, isBlocked: true };
+    }
   }
 }

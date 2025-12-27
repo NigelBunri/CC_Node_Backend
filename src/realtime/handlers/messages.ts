@@ -1,176 +1,121 @@
-import { Server, Socket } from 'socket.io';
+// src/realtime/handlers/messages.handlers.ts
 
-import { EVT, rooms, SocketPrincipal } from '../../chat/chat.types';
-import { RateLimitService } from '../../chat/infra/rate-limit/rate-limit.service';
-import { DjangoConversationClient } from '../../chat/integrations/django/django-conversation.client';
-import { DjangoSeqClient } from '../../chat/integrations/django/django-seq.client';
+import { BadRequestException } from '@nestjs/common';
+import { Socket } from 'socket.io';
+
+import { EVT, Ack, SendMessageAck } from '../../chat/chat.types';
+import { SendMessageDto } from '../../chat/features/messages/messages.dto';
 
 import { MessagesService } from '../../chat/features/messages/messages.service';
+import { DjangoConversationClient } from '../../chat/integrations/django/django-conversation.client';
+import { DjangoSeqClient } from '../../chat/integrations/django/django-seq.client';
+import { RateLimitService } from '../../chat/infra/rate-limit/rate-limit.service';
 
-import { SendPayload as DomainSendPayload, EditPayload as DomainEditPayload, DeletePayload as DomainDeletePayload } from '../../chat/features/messages/messages.dto';
-import { requirePrincipal, resolveDeviceId } from './utils';
-import { MessageKind } from 'src/chat/features/messages/schemas/message.schema';
+import { convRoom } from './utils';
 
-type AuthedSocket = Socket & { principal?: SocketPrincipal };
-
-export type WsSendPayload = DomainSendPayload;
-
-export type WsEditPayload = DomainEditPayload;
-
-export type WsDeletePayload = DomainDeletePayload;
-
-function toMessageDTO(message: any) {
-  return {
-    id: String(message._id ?? message.id ?? message.serverId),
-    conversationId: message.conversationId,
-    seq: message.seq,
-    clientId: message.clientId,
-    senderId: message.senderId,
-    senderDeviceId: message.senderDeviceId,
-    kind: message.kind,
-
-    ciphertext: message.ciphertext,
-    encryptionMeta: message.encryptionMeta,
-
-    text: message.text,
-    attachments: message.attachments ?? [],
-
-    reply: message.reply,
-    forward: message.forward,
-    mentions: message.mentions,
-    linkPreview: message.linkPreview,
-    poll: message.poll,
-    ephemeral: message.ephemeral,
-
-    edited: !!message.edited,
-    editedAt: message.editedAt,
-    deleteState: message.deleteState,
-    deletedAt: message.deletedAt,
-    deletedBy: message.deletedBy,
-
-    reactions: message.reactions ?? [],
-    deliveredTo: message.deliveredTo ?? [],
-    readBy: message.readBy ?? [],
-    playedBy: message.playedBy ?? [],
-
-    createdAt: message.createdAt,
-    updatedAt: message.updatedAt,
-  };
+function ackErr(code: string, message: string, details?: any) {
+  return { ok: false, error: { code, message, details } } as const;
+}
+function ackOk<T>(data: T) {
+  return { ok: true, data } as const;
 }
 
-export async function onSend(ctx: {
-  server: Server;
-  client: AuthedSocket;
-  payload: WsSendPayload;
-  limiter: RateLimitService;
-  convClient: DjangoConversationClient;
-  seqClient: DjangoSeqClient;
-  messages: MessagesService;
-}) {
-  const principal = requirePrincipal(ctx.client);
-  const deviceId = resolveDeviceId(ctx.client);
+export class MessagesHandlers {
+  constructor(
+    private readonly messages: MessagesService,
+    private readonly perms: DjangoConversationClient,
+    private readonly seq: DjangoSeqClient,
+    private readonly rate: RateLimitService,
+  ) {}
 
-  ctx.limiter.assert(principal.userId, 'send');
-  await ctx.convClient.assertConversationMemberOrThrow(principal.userId, ctx.payload.conversationId);
+  /**
+   * Handle WS send message:
+   * - auth principal already attached by WsAuthGuard
+   * - ws-perms check
+   * - rate limit
+   * - allocate seq via Django
+   * - idempotent save by (conversationId, clientId)
+   * - emit chat.message
+   */
+  async onSendMessage(io: any, socket: Socket, body: SendMessageDto): Promise<Ack<SendMessageAck>> {
+    const principal = socket.principal;
+    if (!principal) return ackErr('AUTH_REQUIRED', 'Missing principal');
 
-  const seq = await ctx.seqClient.allocateSeq(ctx.payload.conversationId);
+    // Basic guard
+    if (!body?.conversationId || !body?.clientId || !body?.kind) {
+      return ackErr('VALIDATION_FAILED', 'Missing required fields');
+    }
 
-  const message = await ctx.messages.sendIdempotent({
-    conversationId: ctx.payload.conversationId,
-    clientId: ctx.payload.clientId,
-    senderId: principal.userId,
-    senderDeviceId: deviceId,
-    kind: ctx.payload.kind as unknown as MessageKind,
-    seq,
-    ciphertext: ctx.payload.ciphertext,
-    encryptionMeta: ctx.payload.encryptionMeta,
-    text: ctx.payload.text,
-    attachments: ctx.payload.attachments,
-    reply: ctx.payload.reply,
-    forward: ctx.payload.forward,
-    mentions: ctx.payload.mentions,
-    ephemeral: ctx.payload.ephemeral,
-    linkPreview: ctx.payload.linkPreview,
-    poll: ctx.payload.poll,
-    nowMs: Date.now(),
-  });
+    // Permission gate
+    try {
+      const p = await this.perms.wsPerms(body.conversationId, principal);
+      if (!p?.isMember) return ackErr('FORBIDDEN', 'Not a member');
+      if (p?.isBlocked) return ackErr('FORBIDDEN', 'Conversation is blocked');
+      if (p?.dmState === 'pending') return ackErr('FORBIDDEN', 'DM request pending');
+    } catch (e: any) {
+      return ackErr('DJANGO_UNAVAILABLE', 'Permission check failed', { reason: e?.message });
+    }
 
-  const dto = toMessageDTO(message);
+    // Rate limit
+    try {
+      this.rate.assertAllowed({
+        key: `send:${principal.userId}`,
+        limit: 25,
+        windowMs: 5000,
+      });
+    } catch {
+      return ackErr('RATE_LIMITED', 'Too many messages');
+    }
 
-  ctx.server.to(rooms.convRoom(ctx.payload.conversationId)).emit(EVT.MESSAGE, dto);
-  ctx.server.to(rooms.userRoom(principal.userId)).emit(EVT.MESSAGE, dto);
+    // Allocate seq
+    let seq: number;
+    try {
+      seq = await this.seq.allocate(body.conversationId);
+      if (!Number.isFinite(seq) || seq <= 0) throw new Error('bad seq');
+    } catch (e: any) {
+      return ackErr('DJANGO_UNAVAILABLE', 'Sequence allocation failed', { reason: e?.message });
+    }
 
-  return { ok: true, message: dto };
-}
+    // Save (idempotent)
+    try {
+      const doc = await this.messages.createIdempotent({
+        senderId: principal.userId,
+        seq,
+        input: body,
+      });
 
-export async function onEdit(ctx: {
-  server: Server;
-  client: AuthedSocket;
-  payload: WsEditPayload;
-  limiter: RateLimitService;
-  convClient: DjangoConversationClient;
-  messages: MessagesService;
-}) {
-  const principal = requirePrincipal(ctx.client);
-  const deviceId = resolveDeviceId(ctx.client);
+      // Emit to conversation room
+      io.to(convRoom(body.conversationId)).emit(EVT.MESSAGE, {
+        serverId: String(doc._id),
+        clientId: doc.clientId,
+        conversationId: doc.conversationId,
+        seq: doc.seq,
+        senderId: doc.senderId,
+        kind: doc.kind,
+        text: doc.text,
+        styledText: doc.styledText,
+        voice: doc.voice,
+        sticker: doc.sticker,
+        attachments: doc.attachments,
+        contacts: doc.contacts,
+        poll: doc.poll,
+        event: doc.event,
+        replyToId: doc.replyToId,
+        isEdited: doc.isEdited,
+        isDeleted: doc.isDeleted,
+        createdAt: doc.createdAt?.toISOString?.() ?? new Date().toISOString(),
+        updatedAt: doc.updatedAt?.toISOString?.(),
+      });
 
-  ctx.limiter.assert(principal.userId, 'edit');
-  await ctx.convClient.assertConversationMemberOrThrow(principal.userId, ctx.payload.conversationId);
-
-  const updated = await ctx.messages.editMessage({
-    conversationId: ctx.payload.conversationId,
-    messageId: ctx.payload.messageId,
-    editorId: principal.userId,
-    editorDeviceId: deviceId,
-    ciphertext: ctx.payload.ciphertext,
-    encryptionMeta: ctx.payload.encryptionMeta,
-    text: ctx.payload.text,
-    attachments: ctx.payload.attachments,
-    nowMs: Date.now(),
-  });
-
-  const dto = toMessageDTO(updated);
-
-  ctx.server.to(rooms.convRoom(ctx.payload.conversationId)).emit(EVT.MESSAGE_EDITED, dto);
-  ctx.server.to(rooms.userRoom(principal.userId)).emit(EVT.MESSAGE_EDITED, dto);
-
-  return { ok: true, message: dto };
-}
-
-export async function onDelete(ctx: {
-  server: Server;
-  client: AuthedSocket;
-  payload: WsDeletePayload;
-  limiter: RateLimitService;
-  convClient: DjangoConversationClient;
-  messages: MessagesService;
-}) {
-  const principal = requirePrincipal(ctx.client);
-
-  ctx.limiter.assert(principal.userId, 'delete');
-  await ctx.convClient.assertConversationMemberOrThrow(principal.userId, ctx.payload.conversationId);
-
-  const updated = await ctx.messages.deleteMessage({
-    conversationId: ctx.payload.conversationId,
-    messageId: ctx.payload.messageId,
-    requesterId: principal.userId,
-    mode: ctx.payload.mode,
-    nowMs: Date.now(),
-  });
-
-  const dto = toMessageDTO(updated);
-
-  const eventPayload = {
-    messageId: ctx.payload.messageId,
-    conversationId: ctx.payload.conversationId,
-    mode: ctx.payload.mode,
-    deletedAt: updated.deletedAt ?? Date.now(),
-    deletedBy: updated.deletedBy ?? principal.userId,
-    message: dto,
-  };
-
-  ctx.server.to(rooms.convRoom(ctx.payload.conversationId)).emit(EVT.MESSAGE_DELETED, eventPayload);
-  ctx.server.to(rooms.userRoom(principal.userId)).emit(EVT.MESSAGE_DELETED, eventPayload);
-
-  return { ok: true };
+      return ackOk({
+        clientId: doc.clientId,
+        serverId: String(doc._id),
+        seq: doc.seq,
+        createdAt: doc.createdAt?.toISOString?.() ?? new Date().toISOString(),
+      });
+    } catch (e: any) {
+      const msg = e instanceof BadRequestException ? e.message : 'Send failed';
+      return ackErr('SEND_FAILED', msg, { reason: e?.message });
+    }
+  }
 }

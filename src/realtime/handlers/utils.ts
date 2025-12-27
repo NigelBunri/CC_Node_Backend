@@ -1,16 +1,25 @@
+// src/realtime/handlers/utils.ts
+
 import { Server, Socket } from 'socket.io';
-import { SocketPrincipal, EVT } from '../../chat/chat.types';
+import { EVT, rooms, SocketPrincipal } from '../../chat/chat.types';
+
+export const convRoom = rooms.convRoom;
+export const userRoom = rooms.userRoom;
 
 export function requirePrincipal(client: Socket & { principal?: SocketPrincipal }): SocketPrincipal {
-  if (!client.principal?.userId) throw new Error('Unauthenticated socket');
-  return client.principal;
+  const p = client.principal;
+  if (!p?.userId) throw new Error('unauthorized');
+  return p;
 }
 
+/**
+ * Resolve a device id for receipts/edits/etc.
+ * - Prefer principal.deviceId if provided
+ * - Else fallback to socket.id for uniqueness
+ */
 export function resolveDeviceId(client: Socket & { principal?: SocketPrincipal }): string {
-  const fromAuth = (client.handshake as any)?.auth?.deviceId;
   const fromPrincipal = client.principal?.deviceId;
-  const deviceId = String(fromAuth ?? fromPrincipal ?? 'unknown');
-  return deviceId || 'unknown';
+  return fromPrincipal && fromPrincipal.trim().length ? fromPrincipal : `socket:${client.id}`;
 }
 
 export function emitPresence(server: Server, userId: string, state: 'online' | 'offline') {

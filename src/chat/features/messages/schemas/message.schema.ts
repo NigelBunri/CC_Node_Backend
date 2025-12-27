@@ -1,138 +1,255 @@
-// src/chat/schemas/message.schema.ts
+// src/chat/features/messages/schemas/message.schema.ts
+
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument } from 'mongoose';
 
 export type MessageDocument = HydratedDocument<Message>;
 
-export enum MessageKind {
-  TEXT = 'text',
-  MEDIA = 'media',
-  VOICE = 'voice',
-  STICKER = 'sticker',
-  CONTACT = 'contact',
-  LOCATION = 'location',
-  POLL = 'poll',
-  EVENT = 'event',
-  SYSTEM = 'system',
-}
+/* ============================================================================
+ * EMBEDDED TYPES (BATCH A)
+ * ============================================================================
+ */
 
-export class ReceiptEntry {
-  @Prop({ type: String, required: true }) userId!: string;
-  @Prop({ type: String, required: true }) deviceId!: string;
-  @Prop({ type: Number }) at?: number;
-}
+@Schema({ _id: false })
+class Attachment {
+  @Prop({ required: true }) id!: string;
+  @Prop({ required: true }) url!: string;
 
+  @Prop({ required: true }) originalName!: string;
+  @Prop({ required: true }) mimeType!: string;
+  @Prop({ required: true, min: 0 }) size!: number;
+
+  @Prop() kind?: string;
+
+  @Prop({ min: 0 }) width?: number;
+  @Prop({ min: 0 }) height?: number;
+  @Prop({ min: 0 }) durationMs?: number;
+  @Prop() thumbUrl?: string;
+}
+const AttachmentSchema = SchemaFactory.createForClass(Attachment);
+
+@Schema({ _id: false })
+class StyledText {
+  @Prop({ required: true }) text!: string;
+  @Prop({ required: true }) backgroundColor!: string;
+  @Prop({ required: true, min: 10, max: 120 }) fontSize!: number;
+  @Prop({ required: true }) fontColor!: string;
+  @Prop() fontFamily?: string;
+}
+const StyledTextSchema = SchemaFactory.createForClass(StyledText);
+
+@Schema({ _id: false })
+class VoiceMeta {
+  @Prop({ required: true, min: 1 }) durationMs!: number;
+}
+const VoiceMetaSchema = SchemaFactory.createForClass(VoiceMeta);
+
+@Schema({ _id: false })
+class Sticker {
+  @Prop({ required: true }) id!: string;
+  @Prop({ required: true }) uri!: string;
+  @Prop() text?: string;
+  @Prop({ min: 0 }) width?: number;
+  @Prop({ min: 0 }) height?: number;
+}
+const StickerSchema = SchemaFactory.createForClass(Sticker);
+
+@Schema({ _id: false })
+class ContactCard {
+  @Prop({ required: true }) id!: string;
+  @Prop({ required: true }) name!: string;
+  @Prop({ required: true }) phone!: string;
+}
+const ContactCardSchema = SchemaFactory.createForClass(ContactCard);
+
+@Schema({ _id: false })
+class PollOption {
+  @Prop({ required: true }) id!: string;
+  @Prop({ required: true }) text!: string;
+  @Prop({ min: 0 }) votes?: number;
+}
+const PollOptionSchema = SchemaFactory.createForClass(PollOption);
+
+@Schema({ _id: false })
+class Poll {
+  @Prop() id?: string;
+  @Prop({ required: true }) question!: string;
+  @Prop({ type: [PollOptionSchema], default: [] }) options!: PollOption[];
+  @Prop() allowMultiple?: boolean;
+  @Prop({ type: Date, default: null })
+  expiresAt?: Date | null;
+}
+const PollSchema = SchemaFactory.createForClass(Poll);
+
+@Schema({ _id: false })
+class EventPayload {
+  @Prop() id?: string;
+  @Prop({ required: true }) title!: string;
+  @Prop() description?: string;
+  @Prop() location?: string;
+  @Prop({ required: true }) startsAt!: string;
+  @Prop() endsAt?: string;
+}
+const EventPayloadSchema = SchemaFactory.createForClass(EventPayload);
+
+/* ============================================================================
+ * LEGACY TYPES (needed by receipts/reactions/sync)
+ * ============================================================================
+ */
+
+@Schema({ _id: false })
 export class ReactionEntry {
-  @Prop({ type: String, required: true }) userId!: string;
-  @Prop({ type: String, required: true }) emoji!: string;
-  @Prop({ type: Number, required: true }) at!: number;
+  @Prop({ required: true }) userId!: string;
+  @Prop({ required: true }) emoji!: string;
+  @Prop({ required: true }) at!: number;
 }
+export const ReactionEntrySchema = SchemaFactory.createForClass(ReactionEntry);
 
-export class AttachmentMeta {
-  @Prop({ type: String, required: true }) id!: string;
-  @Prop({ type: String, required: true }) type!: string;
-  @Prop({ type: String }) mime?: string;
-  @Prop({ type: String }) name?: string;
-  @Prop({ type: Number }) size?: number;
-  @Prop({ type: Number }) width?: number;
-  @Prop({ type: Number }) height?: number;
-  @Prop({ type: Number }) durationMs?: number;
-  @Prop({ type: String }) sha256?: string;
-  @Prop({ type: String }) thumbnailId?: string;
-  @Prop({ type: Object }) extra?: Record<string, any>;
+@Schema({ _id: false })
+export class ReceiptEntry {
+  @Prop({ required: true }) userId!: string;
+  @Prop({ required: true }) deviceId!: string;
+  @Prop({ required: true }) atMs!: number;
 }
+export const ReceiptEntrySchema = SchemaFactory.createForClass(ReceiptEntry);
 
-export class ReplyMeta {
-  @Prop({ type: String }) toMessageId?: string;
-  @Prop({ type: Number }) toSeq?: number;
-  @Prop({ type: String }) toUserId?: string;
-  @Prop({ type: String }) previewText?: string;
+@Schema({ _id: false })
+class Ephemeral {
+  @Prop({ default: false }) enabled!: boolean;
+  @Prop({ default: false }) startAfterRead!: boolean;
+  @Prop({ min: 1 }) ttlSeconds?: number;
+  @Prop({ min: 0 }) expireAt?: number;
 }
+const EphemeralSchema = SchemaFactory.createForClass(Ephemeral);
 
-export class ForwardMeta {
-  @Prop({ type: Boolean, default: false }) isForwarded!: boolean;
-  @Prop({ type: Number, default: 0 }) forwardCount!: number;
-  @Prop({ type: String }) originalMessageId?: string;
-  @Prop({ type: String }) originalConversationId?: string;
-}
+/* ============================================================================
+ * MESSAGE
+ * ============================================================================
+ */
 
-export class MentionMeta {
-  @Prop({ type: [String], default: [] }) userIds!: string[];
-}
+export type MessageKind =
+  | 'text'
+  | 'voice'
+  | 'styled_text'
+  | 'sticker'
+  | 'system'
+  | 'contacts'
+  | 'poll'
+  | 'event';
 
-export class EphemeralMeta {
-  @Prop({ type: Boolean, default: false }) enabled!: boolean;
-  @Prop({ type: Number }) ttlSeconds?: number;
-  @Prop({ type: Boolean, default: false }) startAfterRead!: boolean;
-  @Prop({ type: Number }) expireAt?: number;
-}
-
-export class LinkPreviewMeta {
-  @Prop({ type: String }) url?: string;
-  @Prop({ type: String }) title?: string;
-  @Prop({ type: String }) description?: string;
-  @Prop({ type: String }) imageUrl?: string;
-}
-
-export class PollMeta {
-  @Prop({ type: String }) question?: string;
-  @Prop({ type: [String], default: [] }) options!: string[];
-  @Prop({ type: Boolean, default: false }) multiple!: boolean;
-  @Prop({ type: Object }) votes?: Record<string, number[]>;
-}
-
-@Schema({ timestamps: true, collection: 'messages' })
+@Schema({ timestamps: true })
 export class Message {
-  @Prop({ type: String, required: true, index: true }) conversationId!: string;
-  @Prop({ type: Number, required: true, index: true }) seq!: number;
-  @Prop({ type: String, required: true, index: true }) clientId!: string;
+  @Prop({ required: true, index: true })
+  conversationId!: string;
 
-  @Prop({ type: String, required: true, index: true }) senderId!: string;
-  @Prop({ type: String, required: true }) senderDeviceId!: string;
+  @Prop({ required: true, index: true })
+  senderId!: string;
 
-  @Prop({ type: String, enum: MessageKind, required: true, index: true })
-  kind!: MessageKind;
+  // Client dedupe key (offline-first)
+  @Prop({ required: true })
+  clientId!: string;
 
-  @Prop({ type: String }) ciphertext?: string;
-  @Prop({ type: Object }) encryptionMeta?: Record<string, any>;
-
-  @Prop({ type: String }) text?: string;
-
-  @Prop({ type: [AttachmentMeta], default: [] }) attachments!: AttachmentMeta[];
-
-  @Prop({ type: ReplyMeta }) reply?: ReplyMeta;
-  @Prop({ type: ForwardMeta }) forward?: ForwardMeta;
-  @Prop({ type: MentionMeta }) mentions?: MentionMeta;
-
-  @Prop({ type: LinkPreviewMeta }) linkPreview?: LinkPreviewMeta;
-  @Prop({ type: PollMeta }) poll?: PollMeta;
-  @Prop({ type: EphemeralMeta }) ephemeral?: EphemeralMeta;
-
-  @Prop({ type: Boolean, default: false }) edited!: boolean;
-  @Prop({ type: Number }) editedAt?: number;
+  // Sequence allocated by Django (authoritative ordering)
+  @Prop({ required: true, index: true })
+  seq!: number;
 
   @Prop({
-    type: String,
-    enum: ['none', 'deleted_for_me', 'deleted_for_everyone'],
-    default: 'none',
-    index: true,
+    required: true,
+    enum: ['text', 'voice', 'styled_text', 'sticker', 'system', 'contacts', 'poll', 'event'],
   })
-  deleteState!: 'none' | 'deleted_for_me' | 'deleted_for_everyone';
+  kind!: MessageKind;
 
-  @Prop({ type: Number }) deletedAt?: number;
-  @Prop({ type: String }) deletedBy?: string;
+  /* ----- Batch A fields ----- */
 
-  @Prop({ type: [ReactionEntry], default: [] }) reactions!: ReactionEntry[];
-  @Prop({ type: [ReceiptEntry], default: [] }) deliveredTo!: ReceiptEntry[];
-  @Prop({ type: [ReceiptEntry], default: [] }) readBy!: ReceiptEntry[];
-  @Prop({ type: [ReceiptEntry], default: [] }) playedBy!: ReceiptEntry[];
+  @Prop()
+  text?: string;
 
-  @Prop({ type: [String], default: [] }) flags!: string[];
+  @Prop({ type: StyledTextSchema })
+  styledText?: StyledText;
 
-  @Prop({ type: String }) searchText?: string;
+  @Prop({ type: VoiceMetaSchema })
+  voice?: VoiceMeta;
+
+  @Prop({ type: StickerSchema })
+  sticker?: Sticker;
+
+  @Prop({ type: [AttachmentSchema], default: undefined })
+  attachments?: Attachment[];
+
+  @Prop({ type: [ContactCardSchema], default: undefined })
+  contacts?: ContactCard[];
+
+  @Prop({ type: PollSchema })
+  poll?: Poll;
+
+  @Prop({ type: EventPayloadSchema })
+  event?: EventPayload;
+
+  @Prop()
+  replyToId?: string;
+
+  @Prop({ default: false })
+  isEdited!: boolean;
+
+  @Prop({ default: false })
+  isDeleted!: boolean;
+
+  // Optional: denormalized preview string for conversation lists
+  @Prop()
+  previewText?: string;
+
+  /* ----- Legacy compatibility fields (keep existing services compiling) ----- */
+
+  @Prop()
+  senderDeviceId?: string;
+
+  @Prop()
+  ciphertext?: string;
+
+  @Prop({ type: Object })
+  encryptionMeta?: Record<string, any>;
+
+  @Prop({ type: [ReactionEntrySchema], default: [] })
+  reactions!: ReactionEntry[];
+
+  @Prop({ type: [ReceiptEntrySchema], default: [] })
+  deliveredTo!: ReceiptEntry[];
+
+  @Prop({ type: [ReceiptEntrySchema], default: [] })
+  readBy!: ReceiptEntry[];
+
+  @Prop({ type: [ReceiptEntrySchema], default: [] })
+  playedBy!: ReceiptEntry[];
+
+  @Prop({ type: EphemeralSchema })
+  ephemeral?: Ephemeral;
+
+  @Prop()
+  deleteState?: 'deleted_for_me' | 'deleted_for_everyone';
+
+  @Prop({ min: 0 })
+  deletedAt?: number;
+
+  @Prop()
+  deletedBy?: string;
+
+  @Prop({ min: 0 })
+  editedAt?: number;
+
+  // Timestamp typing (mongoose timestamps option)
+  createdAt!: Date;
+  updatedAt!: Date;
 }
 
 export const MessageSchema = SchemaFactory.createForClass(Message);
+
+// ---- Indexes ----
+
+// Strict ordering queries
 MessageSchema.index({ conversationId: 1, seq: 1 }, { unique: true });
+
+// Idempotency: avoid duplicate messages on retries/reconnect flush
 MessageSchema.index({ conversationId: 1, clientId: 1 }, { unique: true });
+
+// Common sort/filter
 MessageSchema.index({ conversationId: 1, createdAt: -1 });
