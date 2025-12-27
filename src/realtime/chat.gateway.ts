@@ -1,430 +1,499 @@
-// NOTE:
-// This gateway implements the **ONE WebSocket PER USER** architecture.
-// - 🔌 One persistent socket per user/device
-// - 👤 A dedicated *user room* (user:{userId}) for inbox / conversation list updates
-// - 💬 Multiple *conversation rooms* (conv:{conversationId}) multiplexed over the SAME socket
-// - 🧠 Django = source of truth (conversations, members, policies)
-// - 🚀 NestJS = realtime delivery / fan-out
-//
-// This file is intentionally verbose (~1000+ LOC) with heavy comments so that
-// future contributors understand *why* things exist, not just *what* they do.
-
-/* ========================================================================== */
-/*                               IMPORTS                                      */
-/* ========================================================================== */
-
 import {
-  WebSocketGateway,
-  OnGatewayInit,
+  ConnectedSocket,
+  MessageBody,
   OnGatewayConnection,
   OnGatewayDisconnect,
   SubscribeMessage,
-  MessageBody,
-  ConnectedSocket,
+  WebSocketGateway,
+  WebSocketServer,
 } from '@nestjs/websockets';
 import { Logger, UseGuards } from '@nestjs/common';
+import { WsException } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 
-import { HttpService } from '@nestjs/axios';
-import { firstValueFrom } from 'rxjs';
-
 import { WsAuthGuard } from '../auth/ws-auth.guard';
-import { MessagesService } from '../messages/messages.service';
-import { SendMessageDto } from '../messages/dto/send-message.dto';
+import { SocketPrincipal, EVT, rooms } from '../chat/chat.types';
+
+import { ReactionsService } from '../chat/features/reactions/reactions.service';
+import { ReceiptsService } from '../chat/features/receipts/receipts.service';
+import { SyncService } from '../chat/features/sync/sync.service';
+
+import { DjangoConversationClient } from '../chat/integrations/django/django-conversation.client';
+import { DjangoSeqClient } from '../chat/integrations/django/django-seq.client';
+import { RateLimitService } from '../chat/infra/rate-limit/rate-limit.service';
 import { PresenceService } from '../presence/presence.service';
-import { DjangoAuthService } from '../auth/django-auth.service';
+import { MessageKind } from 'src/chat/features/messages/schemas/message.schema';
+import { MessagesService } from 'src/chat/features/messages/messages.service';
 
-/* ========================================================================== */
-/*                               CORE TYPES                                   */
-/* ========================================================================== */
+type AuthedSocket = Socket & { principal?: SocketPrincipal };
 
-// 👤 Authenticated identity resolved from Django token introspection
-// This is attached to socket.principal during handshake
-export type Principal = {
-  userId: string;
-  username?: string;
-  isPremium?: boolean;
-  scopes?: string[];
-};
+type JoinPayload = { conversationId: string };
+type LeavePayload = { conversationId: string };
 
-// 💬 Conversation identifier (Django owns the ID)
-export type ConversationId = string;
+type SendPayload = {
+  conversationId: string;
+  clientId: string;
+  kind: MessageKind;
 
-// 🧩 Socket.IO room helpers
-// IMPORTANT: rooms are *logical channels*, NOT sockets
-const userRoom = (userId: string) => `user:${userId}`; // inbox / conversation list
-const convRoom = (id: string) => `conv:${id}`; // per-conversation messages
-
-/* ========================================================================== */
-/*                       DJANGO WIRE / POLICY TYPES                            */
-/* ========================================================================== */
-
-// Minimal user shape as returned by Django serializers
-export type DjangoUserLite = {
-  id: number | string;
-  [key: string]: any;
-};
-
-export type DjangoConversationMemberWire = {
-  id?: number | string;
-  user?: DjangoUserLite | number | string | null;
-  is_active?: boolean;
-  left_at?: string | null;
-  [key: string]: any;
-};
-
-export type DjangoConversation = {
-  id: string;
-  type: 'direct' | 'group' | 'channel' | 'post' | 'thread' | 'system';
-  request_state?: 'none' | 'pending' | 'accepted' | 'rejected';
-  request_initiator?: DjangoUserLite | number | string | null;
-  request_recipient?: DjangoUserLite | number | string | null;
-  members?: DjangoConversationMemberWire[];
-  participants?: DjangoConversationMemberWire[];
-};
-
-/* ========================================================================== */
-/*                       RICH MESSAGE WIRE TYPES                               */
-/* ========================================================================== */
-
-// 📎 Attachments already uploaded to Django; WS carries only metadata
-export type AttachmentKind = 'image' | 'video' | 'audio' | 'document' | 'other';
-
-export type AttachmentWireMeta = {
-  id: string;
-  url: string;
-  originalName: string;
-  mimeType: string;
-  size: number;
-  kind?: AttachmentKind | string;
-  width?: number;
-  height?: number;
-  durationMs?: number;
-};
-
-// 🎙️ Voice message
-export type VoiceWirePayload = {
-  uri: string;
-  durationMs: number;
-  waveform?: number[];
-};
-
-// 🎨 Styled text / custom message
-export type StyledTextWirePayload = {
-  text: string;
-  backgroundColor: string;
-  fontSize: number;
-  fontColor: string;
-  fontFamily?: string | null;
-};
-
-// 😀 Sticker
-export type StickerWirePayload = {
-  id: string;
-  uri: string;
-  text?: string;
-  width?: number;
-  height?: number;
-};
-
-// 👥 Shared contacts
-export type ContactWirePayload = {
-  name: string;
-  phone: string;
-};
-
-export type PollWirePayload = any;
-export type EventWirePayload = any;
-
-// 📦 Payload sent by frontend for `chat.send`
-export type ChatSendWirePayload = {
-  conversationId: ConversationId;
-  senderId?: string; // ignored; server trusts principal.userId
-  senderName?: string | null;
-
-  // text or encrypted text
-  text?: string;
   ciphertext?: string;
+  encryptionMeta?: Record<string, any>;
+  text?: string;
 
-  attachments?: AttachmentWireMeta[];
-
-  kind?:
-    | 'text'
-    | 'voice'
-    | 'styled_text'
-    | 'sticker'
-    | 'contacts'
-    | 'poll'
-    | 'event'
-    | 'system';
-
-  voice?: VoiceWirePayload | null;
-  styledText?: StyledTextWirePayload | null;
-  sticker?: StickerWirePayload | null;
-  contacts?: ContactWirePayload[];
-  poll?: PollWirePayload | null;
-  event?: EventWirePayload | null;
-
-  replyToId?: string | null;
-  clientId?: string; // idempotency from frontend
+  attachments?: any[];
+  reply?: any;
+  forward?: any;
+  mentions?: any;
+  ephemeral?: any;
+  linkPreview?: any;
+  poll?: any;
 };
 
-/* ========================================================================== */
-/*                            GATEWAY SETUP                                   */
-/* ========================================================================== */
+type EditPayload = {
+  conversationId: string;
+  messageId: string;
+
+  ciphertext?: string;
+  encryptionMeta?: Record<string, any>;
+  text?: string;
+  attachments?: any[];
+};
+
+type DeletePayload = {
+  conversationId: string;
+  messageId: string;
+  mode: 'deleted_for_me' | 'deleted_for_everyone';
+};
+
+type ReactionPayload = {
+  conversationId: string;
+  messageId: string;
+  emoji: string;
+  mode: 'add' | 'remove';
+};
+
+type ReceiptPayload = {
+  conversationId: string;
+  messageId: string;
+  type: 'delivered' | 'read' | 'played';
+  atMs?: number;
+};
+
+type TypingPayload = {
+  conversationId: string;
+  isTyping: boolean;
+};
+
+type GapCheckPayload = {
+  conversationId: string;
+  fromSeq: number;
+  toSeq: number;
+};
+
+type CallOfferPayload = { conversationId: string; callId: string; toUserId: string; sdp: any };
+type CallAnswerPayload = { conversationId: string; callId: string; toUserId: string; sdp: any };
+type CallIcePayload = { conversationId: string; callId: string; toUserId: string; candidate: any };
+type CallHangupPayload = { conversationId: string; callId: string; toUserId: string; reason?: string };
 
 @WebSocketGateway({
-  // 🔌 Single endpoint for ALL realtime features
-  path: process.env.WS_PATH ?? '/ws',
-  cors: { origin: (process.env.ORIGINS ?? '').split(',').filter(Boolean) },
+  path: process.env.WS_PATH || '/ws',
+  cors: { origin: (process.env.ORIGINS ?? '*').split(',') },
 })
-export class ChatGateway
-  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
-{
-  private server!: Server;
-  private readonly log = new Logger(ChatGateway.name);
+@UseGuards(WsAuthGuard)
+export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
+  @WebSocketServer()
+  server!: Server;
 
-  // 🧠 Socket → joined conversations
-  // Used ONLY for safety checks ("are you joined?")
-  private memberships = new Map<string, Set<ConversationId>>();
+  private readonly logger = new Logger(ChatGateway.name);
 
   constructor(
     private readonly messages: MessagesService,
+    private readonly reactions: ReactionsService,
+    private readonly receipts: ReceiptsService,
+    private readonly sync: SyncService,
+    private readonly perms: DjangoConversationClient,
+    private readonly seqClient: DjangoSeqClient,
+    private readonly rate: RateLimitService,
     private readonly presence: PresenceService,
-    private readonly auth: DjangoAuthService,
-    private readonly http: HttpService,
   ) {}
 
-  /* ======================================================================== */
-  /*                         GATEWAY LIFECYCLE                                 */
-  /* ======================================================================== */
-
-  afterInit(server: Server) {
-    this.server = server;
-    this.log.log('🚀 ChatGateway initialized');
-
-    // 🔐 Handshake authentication middleware
-    // This runs BEFORE handleConnection
-    this.server.use(async (socket: Socket, next) => {
-      try {
-        const header = socket.handshake?.headers?.authorization as
-          | string
-          | undefined;
-        const bearer = header?.startsWith('Bearer ')
-          ? header.slice(7)
-          : undefined;
-        const token =
-          (socket.handshake.auth?.token as string | undefined) || bearer;
-
-        if (!token) {
-          return next(new Error('Unauthorized: missing token'));
-        }
-
-        // 🔎 Ask Django who this user is
-        const principal = await this.auth.introspect(token);
-
-        // Attach identity to socket
-        (socket as any).principal = principal as Principal;
-        (socket as any).token = token;
-
-        return next();
-      } catch (err) {
-        this.log.warn(`Handshake auth failed: ${String(err)}`);
-        return next(new Error('Unauthorized'));
-      }
-    });
-  }
-
-  /* ------------------------------------------------------------------------ */
-  /*                       CONNECTION / DISCONNECTION                          */
-  /* ------------------------------------------------------------------------ */
-
-  async handleConnection(client: Socket) {
-    const p = (client as any).principal as Principal | undefined;
-
-    if (!p) {
+  async handleConnection(client: AuthedSocket) {
+    const p = client.principal;
+    if (!p?.userId) {
       client.disconnect(true);
       return;
     }
 
-    // 👤 STEP 1: Join the USER ROOM
-    // This room receives:
-    // - conversation.created
-    // - conversation.updated
-    // - unread count changes
-    // - system notifications
-    client.join(userRoom(p.userId));
+    client.join(rooms.userRoom(p.userId));
+    this.presence.markOnline(p.userId);
 
-    // 🧠 Track joined conversations per socket
-    this.memberships.set(client.id, new Set());
-
-    // 🟢 Presence
-    await this.presence.markOnline(p.userId, client.id);
-
-    this.log.log(`🔌 Connected user=${p.userId} socket=${client.id}`);
-
-    // 📡 FRONTEND REQUIREMENT:
-    // On connect, frontend must:
-    // 1) Fetch conversation list via HTTP (Django)
-    // 2) Then listen for socket events (no polling)
+    this.server.emit(EVT.PRESENCE, { userId: p.userId, state: 'online', at: Date.now() });
+    this.logger.log(`connected user=${p.userId}`);
   }
 
-  async handleDisconnect(client: Socket) {
-    const p = (client as any).principal as Principal | undefined;
+  async handleDisconnect(client: AuthedSocket) {
+    const p = client.principal;
+    if (!p?.userId) return;
 
-    this.memberships.delete(client.id);
-
-    if (p) {
-      await this.presence.markOffline(p.userId, client.id);
-    }
-
-    this.log.log(`❌ Disconnected socket=${client.id} user=${p?.userId}`);
+    this.presence.markOffline(p.userId);
+    this.server.emit(EVT.PRESENCE, { userId: p.userId, state: 'offline', at: Date.now() });
+    this.logger.log(`disconnected user=${p.userId}`);
   }
 
-  /* ======================================================================== */
-  /*                     🔔 DJANGO → NESTJS EVENTS                             */
-  /* ======================================================================== */
-  // These events are triggered by Django via Redis Pub/Sub or HTTP webhook.
-  // They update the *conversation list* (NOT messages).
+  @SubscribeMessage(EVT.JOIN)
+  async onJoin(@ConnectedSocket() client: AuthedSocket, @MessageBody() payload: JoinPayload) {
+    return this.safeAck(async () => {
+      const p = this.requirePrincipal(client);
+      this.rate.assert(p.userId, 'join');
 
-  // 🧩 Example event payload:
-  // { type: 'conversation.created', conversationId, members[], preview }
+      await this.perms.assertConversationMemberOrThrow(p.userId, payload.conversationId);
+      client.join(rooms.convRoom(payload.conversationId));
 
-  @SubscribeMessage('internal.conversation.created')
-  handleConversationCreated(@MessageBody() payload: any) {
-    const { members } = payload;
-
-    for (const uid of members) {
-      this.server.to(userRoom(String(uid))).emit('conversation.created', payload);
-    }
-  }
-
-  @SubscribeMessage('internal.conversation.updated')
-  handleConversationUpdated(@MessageBody() payload: any) {
-    const { members } = payload;
-
-    for (const uid of members) {
-      this.server.to(userRoom(String(uid))).emit('conversation.updated', payload);
-    }
-  }
-
-  /* ======================================================================== */
-  /*                     💬 CONVERSATION JOIN / LEAVE                          */
-  /* ======================================================================== */
-
-  // 🟢 User opens a chat screen
-  @UseGuards(WsAuthGuard)
-  @SubscribeMessage('chat.join')
-  joinConversation(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() body: { conversationId: ConversationId },
-  ) {
-    const p = (client as any).principal as Principal;
-
-    client.join(convRoom(body.conversationId));
-
-    if (!this.memberships.get(client.id)) {
-      this.memberships.set(client.id, new Set());
-    }
-    this.memberships.get(client.id)!.add(body.conversationId);
-
-    this.log.log(`💬 User=${p.userId} joined conv=${body.conversationId}`);
-
-    return { ok: true };
-  }
-
-  // 🔴 User leaves chat screen
-  @UseGuards(WsAuthGuard)
-  @SubscribeMessage('chat.leave')
-  leaveConversation(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() body: { conversationId: ConversationId },
-  ) {
-    client.leave(convRoom(body.conversationId));
-    this.memberships.get(client.id)?.delete(body.conversationId);
-    return { ok: true };
-  }
-
-  /* ======================================================================== */
-  /*                           ✉️ SEND MESSAGE                                 */
-  /* ======================================================================== */
-
-  @UseGuards(WsAuthGuard)
-  @SubscribeMessage('chat.send')
-  async sendMessage(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() body: ChatSendWirePayload,
-  ) {
-    const p = (client as any).principal as Principal;
-
-    // 🛑 Safety: must have joined the conversation
-    if (!this.memberships.get(client.id)?.has(body.conversationId)) {
-      return { ok: false, error: 'not_joined' };
-    }
-
-    // 🧠 Django policy check (DM requests, membership, etc.)
-    // ... (kept identical to your existing logic)
-
-    // 💾 Persist message
-    const dto: SendMessageDto = {
-      conversationId: body.conversationId,
-      ciphertext: body.ciphertext ?? body.text ?? '',
-      attachments: body.attachments ?? [],
-      replyToId: body.replyToId ?? null,
-      kind: body.kind,
-      voice: body.voice ?? null,
-      styledText: body.styledText ?? null,
-      sticker: body.sticker ?? null,
-      contacts: body.contacts ?? [],
-      poll: body.poll ?? null,
-      event: body.event ?? null,
-    } as any;
-
-    const msg = await this.messages.save(p.userId, dto, (client as any).token);
-
-    // 📡 Fan-out to conversation room
-    this.server.to(convRoom(body.conversationId)).emit('chat.message', {
-      id: msg.id,
-      conversationId: msg.conversationId,
-      senderId: msg.senderId,
-      senderName: body.senderName ?? p.username ?? p.userId,
-      text: msg.ciphertext,
-      ciphertext: msg.ciphertext,
-      attachments: msg.attachments ?? [],
-      kind: msg.kind,
-      voice: msg.voice,
-      styledText: msg.styledText,
-      sticker: msg.sticker,
-      contacts: msg.contacts ?? [],
-      poll: msg.poll ?? null,
-      event: msg.event ?? null,
-      createdAt: msg.createdAt,
-      replyToId: msg.replyToId,
-      status: msg.status,
+      return { ok: true };
     });
+  }
 
-    // 🔔 Also notify USER ROOM for inbox preview updates
-    this.server
-      .to(userRoom(p.userId))
-      .emit('conversation.last_message', {
-        conversationId: body.conversationId,
-        lastMessage: msg,
+  @SubscribeMessage(EVT.LEAVE)
+  async onLeave(@ConnectedSocket() client: AuthedSocket, @MessageBody() payload: LeavePayload) {
+    return this.safeAck(async () => {
+      const p = this.requirePrincipal(client);
+      this.rate.assert(p.userId, 'leave');
+
+      client.leave(rooms.convRoom(payload.conversationId));
+      return { ok: true };
+    });
+  }
+
+  @SubscribeMessage(EVT.SEND)
+  async onSend(@ConnectedSocket() client: AuthedSocket, @MessageBody() payload: SendPayload) {
+    return this.safeAck(async () => {
+      const p = this.requirePrincipal(client);
+      this.rate.assert(p.userId, 'send');
+
+      await this.perms.assertConversationMemberOrThrow(p.userId, payload.conversationId);
+
+      const seq = await this.seqClient.allocateSeq(payload.conversationId);
+
+      const message = await this.messages.sendIdempotent({
+        ...payload,
+        senderId: p.userId,
+        senderDeviceId: p.deviceId ?? 'device',
+        seq,
+        nowMs: Date.now(),
       });
 
-    return { ok: true, id: msg.id };
+      const dto = this.toMessageDTO(message);
+
+      this.server.to(rooms.convRoom(payload.conversationId)).emit(EVT.MESSAGE, dto);
+      this.server.to(rooms.userRoom(p.userId)).emit(EVT.MESSAGE, dto);
+
+      return { ok: true, message: dto };
+    });
   }
 
-  /* ======================================================================== */
-  /*                             🧑‍💻 FRONTEND NOTES                           */
-  /* ======================================================================== */
-  // FRONTEND MUST:
-  // 🔹 Maintain ONE socket per logged-in user
-  // 🔹 On connect:
-  //    - Fetch conversations via HTTP (Django)
-  // 🔹 Listen to:
-  //    - conversation.created
-  //    - conversation.updated
-  //    - conversation.last_message
-  // 🔹 Join conv rooms ONLY when chat screen is open
-  // 🔹 Never poll for conversations
+  @SubscribeMessage(EVT.EDIT)
+  async onEdit(@ConnectedSocket() client: AuthedSocket, @MessageBody() payload: EditPayload) {
+    return this.safeAck(async () => {
+      const p = this.requirePrincipal(client);
+      this.rate.assert(p.userId, 'edit');
+
+      await this.perms.assertConversationMemberOrThrow(p.userId, payload.conversationId);
+
+      const updated = await this.messages.editMessage({
+        conversationId: payload.conversationId,
+        messageId: payload.messageId,
+        editorId: p.userId,
+        editorDeviceId: p.deviceId ?? 'device',
+        ciphertext: payload.ciphertext,
+        encryptionMeta: payload.encryptionMeta,
+        text: payload.text,
+        attachments: payload.attachments,
+        nowMs: Date.now(),
+      });
+
+      const dto = this.toMessageDTO(updated);
+
+      this.server.to(rooms.convRoom(payload.conversationId)).emit(EVT.MESSAGE_EDITED, dto);
+      this.server.to(rooms.userRoom(p.userId)).emit(EVT.MESSAGE_EDITED, dto);
+
+      return { ok: true, message: dto };
+    });
+  }
+
+  @SubscribeMessage(EVT.DELETE)
+  async onDelete(@ConnectedSocket() client: AuthedSocket, @MessageBody() payload: DeletePayload) {
+    return this.safeAck(async () => {
+      const p = this.requirePrincipal(client);
+      this.rate.assert(p.userId, 'delete');
+
+      await this.perms.assertConversationMemberOrThrow(p.userId, payload.conversationId);
+
+      const updated = await this.messages.deleteMessage({
+        conversationId: payload.conversationId,
+        messageId: payload.messageId,
+        requesterId: p.userId,
+        mode: payload.mode,
+        nowMs: Date.now(),
+      });
+
+      const dto = this.toMessageDTO(updated);
+
+      const eventPayload = {
+        messageId: payload.messageId,
+        conversationId: payload.conversationId,
+        mode: payload.mode,
+        deletedAt: updated.deletedAt ?? Date.now(),
+        deletedBy: updated.deletedBy ?? p.userId,
+        message: dto,
+      };
+
+      this.server.to(rooms.convRoom(payload.conversationId)).emit(EVT.MESSAGE_DELETED, eventPayload);
+      this.server.to(rooms.userRoom(p.userId)).emit(EVT.MESSAGE_DELETED, eventPayload);
+
+      return { ok: true };
+    });
+  }
+
+  @SubscribeMessage(EVT.REACT)
+  async onReact(@ConnectedSocket() client: AuthedSocket, @MessageBody() payload: ReactionPayload) {
+    return this.safeAck(async () => {
+      const p = this.requirePrincipal(client);
+      this.rate.assert(p.userId, 'react');
+
+      await this.perms.assertConversationMemberOrThrow(p.userId, payload.conversationId);
+
+      const updated = await this.reactions.react({
+        conversationId: payload.conversationId,
+        messageId: payload.messageId,
+        userId: p.userId,
+        emoji: payload.emoji,
+        mode: payload.mode,
+        nowMs: Date.now(),
+      });
+
+      const dto = this.toMessageDTO(updated);
+
+      const eventPayload = {
+        conversationId: payload.conversationId,
+        messageId: payload.messageId,
+        reactions: dto.reactions ?? [],
+      };
+
+      this.server.to(rooms.convRoom(payload.conversationId)).emit(EVT.MESSAGE_REACTION, eventPayload);
+      this.server.to(rooms.userRoom(p.userId)).emit(EVT.MESSAGE_REACTION, eventPayload);
+
+      return { ok: true, reactions: dto.reactions ?? [] };
+    });
+  }
+
+  @SubscribeMessage(EVT.RECEIPT)
+  async onReceipt(@ConnectedSocket() client: AuthedSocket, @MessageBody() payload: ReceiptPayload) {
+    return this.safeAck(async () => {
+      const p = this.requirePrincipal(client);
+      this.rate.assert(p.userId, 'receipt');
+
+      await this.perms.assertConversationMemberOrThrow(p.userId, payload.conversationId);
+
+      const updated = await this.receipts.addReceipt({
+        conversationId: payload.conversationId,
+        messageId: payload.messageId,
+        userId: p.userId,
+        deviceId: p.deviceId ?? 'device',
+        type: payload.type,
+        atMs: payload.atMs,
+      });
+
+      const dto = this.toMessageDTO(updated);
+
+      const eventPayload = {
+        conversationId: payload.conversationId,
+        messageId: payload.messageId,
+        deliveredTo: dto.deliveredTo ?? [],
+        readBy: dto.readBy ?? [],
+        playedBy: dto.playedBy ?? [],
+      };
+
+      this.server.to(rooms.convRoom(payload.conversationId)).emit(EVT.MESSAGE_RECEIPT, eventPayload);
+      this.server.to(rooms.userRoom(p.userId)).emit(EVT.MESSAGE_RECEIPT, eventPayload);
+
+      return { ok: true };
+    });
+  }
+
+  @SubscribeMessage(EVT.TYPING)
+  async onTyping(@ConnectedSocket() client: AuthedSocket, @MessageBody() payload: TypingPayload) {
+    return this.safeAck(async () => {
+      const p = this.requirePrincipal(client);
+      this.rate.assert(p.userId, 'typing');
+
+      await this.perms.assertConversationMemberOrThrow(p.userId, payload.conversationId);
+
+      client.to(rooms.convRoom(payload.conversationId)).emit(EVT.TYPING, {
+        conversationId: payload.conversationId,
+        userId: p.userId,
+        isTyping: !!payload.isTyping,
+        at: Date.now(),
+      });
+
+      return { ok: true };
+    });
+  }
+
+  @SubscribeMessage(EVT.GAP_CHECK)
+  async onGapCheck(@ConnectedSocket() client: AuthedSocket, @MessageBody() payload: GapCheckPayload) {
+    return this.safeAck(async () => {
+      const p = this.requirePrincipal(client);
+      this.rate.assert(p.userId, 'gap');
+
+      await this.perms.assertConversationMemberOrThrow(p.userId, payload.conversationId);
+
+      const { missing, messages } = await this.sync.gapCheck(payload.conversationId, payload.fromSeq, payload.toSeq);
+      const dtos = (messages ?? []).map((m: any) => this.toMessageDTO(m));
+
+      if (dtos.length) {
+        client.emit(EVT.GAP_FILL, {
+          conversationId: payload.conversationId,
+          fromSeq: payload.fromSeq,
+          toSeq: payload.toSeq,
+          messages: dtos,
+        });
+      }
+
+      return { ok: true, missing: missing ?? [] };
+    });
+  }
+
+  @SubscribeMessage(EVT.CALL_OFFER)
+  async onCallOffer(@ConnectedSocket() client: AuthedSocket, @MessageBody() payload: CallOfferPayload) {
+    return this.safeAck(async () => {
+      const p = this.requirePrincipal(client);
+      this.rate.assert(p.userId, 'call');
+
+      await this.perms.assertConversationMemberOrThrow(p.userId, payload.conversationId);
+
+      this.server.to(rooms.userRoom(payload.toUserId)).emit(EVT.CALL_OFFER, {
+        fromUserId: p.userId,
+        conversationId: payload.conversationId,
+        callId: payload.callId,
+        sdp: payload.sdp,
+        at: Date.now(),
+      });
+
+      return { ok: true };
+    });
+  }
+
+  @SubscribeMessage(EVT.CALL_ANSWER)
+  async onCallAnswer(@ConnectedSocket() client: AuthedSocket, @MessageBody() payload: CallAnswerPayload) {
+    return this.safeAck(async () => {
+      const p = this.requirePrincipal(client);
+      this.rate.assert(p.userId, 'call');
+
+      await this.perms.assertConversationMemberOrThrow(p.userId, payload.conversationId);
+
+      this.server.to(rooms.userRoom(payload.toUserId)).emit(EVT.CALL_ANSWER, {
+        fromUserId: p.userId,
+        conversationId: payload.conversationId,
+        callId: payload.callId,
+        sdp: payload.sdp,
+        at: Date.now(),
+      });
+
+      return { ok: true };
+    });
+  }
+
+  @SubscribeMessage(EVT.CALL_ICE)
+  async onCallIce(@ConnectedSocket() client: AuthedSocket, @MessageBody() payload: CallIcePayload) {
+    return this.safeAck(async () => {
+      const p = this.requirePrincipal(client);
+      this.rate.assert(p.userId, 'call');
+
+      await this.perms.assertConversationMemberOrThrow(p.userId, payload.conversationId);
+
+      this.server.to(rooms.userRoom(payload.toUserId)).emit(EVT.CALL_ICE, {
+        fromUserId: p.userId,
+        conversationId: payload.conversationId,
+        callId: payload.callId,
+        candidate: payload.candidate,
+        at: Date.now(),
+      });
+
+      return { ok: true };
+    });
+  }
+
+  @SubscribeMessage(EVT.CALL_HANGUP)
+  async onCallHangup(@ConnectedSocket() client: AuthedSocket, @MessageBody() payload: CallHangupPayload) {
+    return this.safeAck(async () => {
+      const p = this.requirePrincipal(client);
+      this.rate.assert(p.userId, 'call');
+
+      await this.perms.assertConversationMemberOrThrow(p.userId, payload.conversationId);
+
+      this.server.to(rooms.userRoom(payload.toUserId)).emit(EVT.CALL_HANGUP, {
+        fromUserId: p.userId,
+        conversationId: payload.conversationId,
+        callId: payload.callId,
+        reason: payload.reason ?? 'hangup',
+        at: Date.now(),
+      });
+
+      return { ok: true };
+    });
+  }
+
+  private requirePrincipal(client: AuthedSocket): SocketPrincipal {
+    const p = client.principal;
+    if (!p?.userId) throw new WsException('unauthorized');
+    return p;
+  }
+
+  private async safeAck<T>(fn: () => Promise<T>): Promise<T | { ok: false; code: string; message: string }> {
+    try {
+      return await fn();
+    } catch (e: any) {
+      const msg = typeof e?.message === 'string' ? e.message : 'error';
+      const code = typeof e?.name === 'string' ? e.name : 'Error';
+      return { ok: false, code, message: msg };
+    }
+  }
+
+  private toMessageDTO(message: any) {
+    return {
+      id: String(message._id ?? message.id ?? message.serverId),
+      conversationId: message.conversationId,
+      seq: message.seq,
+      clientId: message.clientId,
+      senderId: message.senderId,
+      senderDeviceId: message.senderDeviceId,
+      kind: message.kind,
+
+      ciphertext: message.ciphertext,
+      encryptionMeta: message.encryptionMeta,
+
+      text: message.text,
+      attachments: message.attachments ?? [],
+
+      reply: message.reply,
+      forward: message.forward,
+      mentions: message.mentions,
+      linkPreview: message.linkPreview,
+      poll: message.poll,
+      ephemeral: message.ephemeral,
+
+      edited: !!message.edited,
+      editedAt: message.editedAt,
+      deleteState: message.deleteState,
+      deletedAt: message.deletedAt,
+      deletedBy: message.deletedBy,
+
+      reactions: message.reactions ?? [],
+      deliveredTo: message.deliveredTo ?? [],
+      readBy: message.readBy ?? [],
+      playedBy: message.playedBy ?? [],
+
+      createdAt: message.createdAt,
+      updatedAt: message.updatedAt,
+    };
+  }
 }

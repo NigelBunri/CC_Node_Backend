@@ -4,8 +4,8 @@ import { MongooseModule } from '@nestjs/mongoose';
 
 import { AuthModule } from './auth/auth.module';
 import { GatewayModule } from './realtime/gateway.module';
-import { MessagesModule } from './messages/messages.module';
-import { PresenceModule } from './presence/presence.module';
+import { MessagesModule } from './chat/features/messages/messages.module';
+import { PresenceModule } from './chat/features/presence/presence.module';
 import { UploadsModule } from './uploads/uploads.module';
 
 @Module({

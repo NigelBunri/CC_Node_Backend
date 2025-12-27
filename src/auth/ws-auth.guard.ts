@@ -1,4 +1,4 @@
-import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
+import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
 import { DjangoAuthService } from './django-auth.service';
 
 @Injectable()
@@ -8,12 +8,13 @@ export class WsAuthGuard implements CanActivate {
   async canActivate(ctx: ExecutionContext): Promise<boolean> {
     const client: any = ctx.switchToWs().getClient();
     const fromHeader = client?.handshake?.headers?.authorization;
-    const bearer = fromHeader?.startsWith('Bearer ') ? fromHeader.slice(7) : undefined;
+    const bearer = typeof fromHeader === 'string' && fromHeader.startsWith('Bearer ') ? fromHeader.slice(7) : undefined;
+
     const token: string | undefined = client?.handshake?.auth?.token || bearer;
-    if (!token) return false;
-    console.log("check token 1: ", token)
+    if (!token) throw new UnauthorizedException('Missing token');
+
     const principal = await this.auth.introspect(token);
-    client.principal = principal; // attach to socket
+    client.principal = principal;
     return true;
   }
 }
