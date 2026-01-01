@@ -1,3 +1,5 @@
+// src/main.ts
+
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { AppModule } from './app.module';
@@ -8,11 +10,17 @@ import fastifyCors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
 import fastifyMultipart from '@fastify/multipart';
 
+// ✅ add this (adjust path if needed)
+import { requestIdMiddleware } from './observability/request-id.middleware';
+
 async function bootstrap() {
   const app = await NestFactory.create<NestFastifyApplication>(
     AppModule,
     new FastifyAdapter({ logger: true }),
   );
+
+  // ✅ request id for every HTTP request (used by HttpLoggingInterceptor)
+  app.use(requestIdMiddleware);
 
   const origins = (process.env.ORIGINS ?? '').split(',').filter(Boolean);
   await app.register(fastifyCors, {

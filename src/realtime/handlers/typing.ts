@@ -1,36 +1,56 @@
-import { Server, Socket } from 'socket.io';
+// src/realtime/handlers/typing.ts
 
-import { EVT, rooms, SocketPrincipal } from '../../chat/chat.types';
-import { RateLimitService } from '../../chat/infra/rate-limit/rate-limit.service';
-import { DjangoConversationClient } from '../../chat/integrations/django/django-conversation.client';
+import type { Server, Socket } from 'socket.io'
+import { EVT, rooms, type Ack, type SocketPrincipal } from '../../chat/chat.types'
+import { getPrincipal, ok, err, safeAck, safeEmit } from './utils'
 
-import { requirePrincipal } from './utils';
+export interface TypingDeps {
+  rateLimitService: {
+    assert(principal: SocketPrincipal, key: string, limit?: number): Promise<void> | void
+  }
+  djangoConversationClient: {
+    assertMember(principal: SocketPrincipal, conversationId: string): Promise<any>
+  }
+  moderationService?: {
+    assertAllowed(args: { conversationId: string; userId: string; action: 'typing' }): Promise<void> | void
+  }
+}
 
-type AuthedSocket = Socket & { principal?: SocketPrincipal };
+export function registerTypingHandlers(server: Server, socket: Socket, deps: TypingDeps) {
+  socket.on(
+    EVT.TYPING,
+    async (
+      payload: { conversationId: string; isTyping: boolean; threadId?: string },
+      ack?: (a: Ack<any>) => void,
+    ) => {
+      const principal = getPrincipal(socket)
+      const conversationId = payload?.conversationId
 
-export type WsTypingPayload = {
-  conversationId: string;
-  isTyping: boolean;
-};
+      if (!conversationId) return safeAck(ack, err('conversationId is required', 'BAD_REQUEST'))
 
-export async function onTyping(ctx: {
-  server: Server;
-  client: AuthedSocket;
-  payload: WsTypingPayload;
-  limiter: RateLimitService;
-  convClient: DjangoConversationClient;
-}) {
-  const principal = requirePrincipal(ctx.client);
+      try {
+        await deps.rateLimitService.assert(principal, `typing:${conversationId}`, 300)
+        await deps.djangoConversationClient.assertMember(principal, conversationId)
+        if (deps.moderationService) {
+          await deps.moderationService.assertAllowed({
+            conversationId,
+            userId: principal.userId,
+            action: 'typing',
+          })
+        }
 
-  ctx.limiter.assert(principal.userId, 'typing');
-  await ctx.convClient.assertConversationMemberOrThrow(principal.userId, ctx.payload.conversationId);
+        safeEmit(server, rooms.convRoom(conversationId), EVT.TYPING, {
+          conversationId,
+          userId: principal.userId,
+          isTyping: !!payload?.isTyping,
+          threadId: payload?.threadId ?? null,
+          at: new Date().toISOString(),
+        })
 
-  ctx.client.to(rooms.convRoom(ctx.payload.conversationId)).emit(EVT.TYPING, {
-    conversationId: ctx.payload.conversationId,
-    userId: principal.userId,
-    isTyping: !!ctx.payload.isTyping,
-    at: Date.now(),
-  });
-
-  return { ok: true };
+        safeAck(ack, ok({ typing: true }))
+      } catch (e: any) {
+        safeAck(ack, err(e?.message ?? 'Typing failed', 'ERROR'))
+      }
+    },
+  )
 }

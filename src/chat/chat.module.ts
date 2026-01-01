@@ -1,49 +1,62 @@
 // src/chat/chat.module.ts
 
-import { Module } from '@nestjs/common';
-import { MongooseModule } from '@nestjs/mongoose';
+import { Module } from '@nestjs/common'
+import { MongooseModule } from '@nestjs/mongoose'
+import { HttpModule } from '@nestjs/axios' // ✅ required for HttpService
 
-import { AuthModule } from '../auth/auth.module';
-import { WsAuthGuard } from '../auth/ws-auth.guard';
+import { AuthModule } from '../auth/auth.module'
+import { WsAuthGuard } from '../auth/ws-auth.guard'
 
-import { Message, MessageSchema } from './features/messages/schemas/message.schema';
+import { Message, MessageSchema } from './features/messages/schemas/message.schema'
 
-import { MessagesService } from './features/messages/messages.service';
-import { ReactionsService } from './features/reactions/reactions.service';
-import { ReceiptsService } from './features/receipts/receipts.service';
-import { SyncService } from './features/sync/sync.service';
-import { PresenceService } from './features/presence/presence.service';
+import { MessagesService } from './features/messages/messages.service'
+import { ReactionsService } from './features/reactions/reactions.service'
+import { ReceiptsService } from './features/receipts/receipts.service'
+import { SyncService } from './features/sync/sync.service'
+import { PresenceService } from './features/presence/presence.service'
 
-import { DjangoConversationClient } from './integrations/django/django-conversation.client';
-import { DjangoSeqClient } from './integrations/django/django-seq.client';
+import { DjangoConversationClient } from './integrations/django/django-conversation.client'
+import { DjangoSeqClient } from './integrations/django/django-seq.client'
 
-import { RateLimitService } from './infra/rate-limit/rate-limit.service';
+import { RateLimitService } from './infra/rate-limit/rate-limit.service'
 
-import { ChatGateway } from '../realtime/chat.gateway';
+import { ChatGateway } from '../realtime/chat.gateway'
 
-// ✅ Batch B modules (they export their services AND include their own Mongoose models)
-import { ThreadsModule } from './features/threads/threads.module';
-import { PinsModule } from './features/pins/pins.module';
-import { StarsModule } from './features/stars/stars.module';
-import { ModerationModule } from './features/moderation/moderation.module';
-import { CallStateModule } from './features/calls/call-state.module';
+// Batch B modules
+import { ThreadsModule } from './features/threads/threads.module'
+import { PinsModule } from './features/pins/pins.module'
+import { StarsModule } from './features/stars/stars.module'
+import { ModerationModule } from './features/moderation/moderation.module'
+import { CallsModule } from './features/calls/calls.module'
+import { SearchModule } from './features/search/search.module'
+
+// ✅ Notifications
+import { NotificationsModule } from '../notifications/notifications.module'
+
+// ✅ Optional compact call history
+import { CallStateModule } from './features/calls/call-state.module'
 
 @Module({
   imports: [
     AuthModule,
 
-    // Batch A message model
+    // ✅ makes HttpService available for DjangoConversationClient/DjangoSeqClient
+    HttpModule,
+
+    // shared Message model
     MongooseModule.forFeature([{ name: Message.name, schema: MessageSchema }]),
 
-    // ✅ Batch B feature modules
     ThreadsModule,
     PinsModule,
     StarsModule,
     ModerationModule,
+    CallsModule,
+    SearchModule,
+
+    NotificationsModule,
     CallStateModule,
   ],
   providers: [
-    // Gateway + guard
     ChatGateway,
     WsAuthGuard,
 

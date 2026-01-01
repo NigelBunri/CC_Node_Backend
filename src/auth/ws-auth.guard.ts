@@ -14,7 +14,8 @@ export class WsAuthGuard implements CanActivate {
     if (!token) throw new UnauthorizedException('Missing token');
 
     const principal = await this.auth.introspect(token);
-    client.principal = principal;
+    const deviceId = client?.handshake?.auth?.deviceId || client?.handshake?.headers?.['x-device-id'];
+    client.principal = { ...principal, token, deviceId };
     return true;
   }
 }

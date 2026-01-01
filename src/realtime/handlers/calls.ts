@@ -1,135 +1,57 @@
-import { Server, Socket } from 'socket.io';
+// src/realtime/handlers/calls.ts
 
-import { rooms, SocketPrincipal } from '../../chat/chat.types';
-import { RateLimitService } from '../../chat/infra/rate-limit/rate-limit.service';
-import { DjangoConversationClient } from '../../chat/integrations/django/django-conversation.client';
-import { requirePrincipal } from './utils';
+import type { Server, Socket } from 'socket.io'
+import { EVT, rooms, type Ack, type SocketPrincipal } from '../../chat/chat.types'
+import { getPrincipal, ok, err, safeAck, safeEmit } from './utils'
 
-type AuthedSocket = Socket & { principal?: SocketPrincipal };
-
-export const CALL_EVT = {
-  CALL_OFFER: 'call.offer',
-  CALL_ANSWER: 'call.answer',
-  CALL_ICE: 'call.ice',
-  CALL_HANGUP: 'call.hangup',
-} as const;
-
-export type CallOfferPayload = {
-  conversationId: string;
-  callId: string;
-  toUserId: string;
-  sdp: any;
-};
-
-export type CallAnswerPayload = {
-  conversationId: string;
-  callId: string;
-  toUserId: string;
-  sdp: any;
-};
-
-export type CallIcePayload = {
-  conversationId: string;
-  callId: string;
-  toUserId: string;
-  candidate: any;
-};
-
-export type CallHangupPayload = {
-  conversationId: string;
-  callId: string;
-  toUserId: string;
-  reason?: string;
-};
-
-export async function onCallOffer(ctx: {
-  server: Server;
-  client: AuthedSocket;
-  payload: CallOfferPayload;
-  limiter: RateLimitService;
-  convClient: DjangoConversationClient;
-}) {
-  const principal = requirePrincipal(ctx.client);
-
-  ctx.limiter.assert(principal.userId, 'call');
-  await ctx.convClient.assertConversationMemberOrThrow(principal.userId, ctx.payload.conversationId);
-
-  ctx.server.to(rooms.userRoom(ctx.payload.toUserId)).emit(CALL_EVT.CALL_OFFER, {
-    fromUserId: principal.userId,
-    conversationId: ctx.payload.conversationId,
-    callId: ctx.payload.callId,
-    sdp: ctx.payload.sdp,
-    at: Date.now(),
-  });
-
-  return { ok: true };
+export interface CallsDeps {
+  rateLimitService: {
+    assert(principal: SocketPrincipal, key: string, limit?: number): Promise<void> | void
+  }
+  djangoConversationClient: {
+    assertMember(principal: SocketPrincipal, conversationId: string): Promise<any>
+  }
+  callsService?: {
+    // optional persistence — Batch B calls note
+    upsertState?: (args: { conversationId: string; state: any }) => Promise<void>
+    clearState?: (args: { conversationId: string }) => Promise<void>
+  }
 }
 
-export async function onCallAnswer(ctx: {
-  server: Server;
-  client: AuthedSocket;
-  payload: CallAnswerPayload;
-  limiter: RateLimitService;
-  convClient: DjangoConversationClient;
-}) {
-  const principal = requirePrincipal(ctx.client);
+export function registerCallHandlers(server: Server, socket: Socket, deps: CallsDeps) {
+  const forward = async (event: string, payload: any, ack?: (a: Ack<any>) => void) => {
+    const principal = getPrincipal(socket)
+    const conversationId = payload?.conversationId
 
-  ctx.limiter.assert(principal.userId, 'call');
-  await ctx.convClient.assertConversationMemberOrThrow(principal.userId, ctx.payload.conversationId);
+    if (!conversationId) return safeAck(ack, err('conversationId is required', 'BAD_REQUEST'))
 
-  ctx.server.to(rooms.userRoom(ctx.payload.toUserId)).emit(CALL_EVT.CALL_ANSWER, {
-    fromUserId: principal.userId,
-    conversationId: ctx.payload.conversationId,
-    callId: ctx.payload.callId,
-    sdp: ctx.payload.sdp,
-    at: Date.now(),
-  });
+    try {
+      await deps.rateLimitService.assert(principal, `call:${conversationId}`, 120)
+      await deps.djangoConversationClient.assertMember(principal, conversationId)
 
-  return { ok: true };
-}
+      // fan out signaling (offer/answer/ice/end)
+      safeEmit(server, rooms.convRoom(conversationId), event, {
+        ...payload,
+        fromUserId: principal.userId,
+        at: new Date().toISOString(),
+      })
 
-export async function onCallIce(ctx: {
-  server: Server;
-  client: AuthedSocket;
-  payload: CallIcePayload;
-  limiter: RateLimitService;
-  convClient: DjangoConversationClient;
-}) {
-  const principal = requirePrincipal(ctx.client);
+      // optional persistence hook
+      if (deps.callsService?.upsertState && (event === EVT.CALL_OFFER || event === EVT.CALL_ANSWER)) {
+        await deps.callsService.upsertState({ conversationId, state: { lastEvent: event, payload } })
+      }
+      if (deps.callsService?.clearState && event === EVT.CALL_END) {
+        await deps.callsService.clearState({ conversationId })
+      }
 
-  ctx.limiter.assert(principal.userId, 'call');
-  await ctx.convClient.assertConversationMemberOrThrow(principal.userId, ctx.payload.conversationId);
+      safeAck(ack, ok({ forwarded: true }))
+    } catch (e: any) {
+      safeAck(ack, err(e?.message ?? 'Call signaling failed', 'ERROR'))
+    }
+  }
 
-  ctx.server.to(rooms.userRoom(ctx.payload.toUserId)).emit(CALL_EVT.CALL_ICE, {
-    fromUserId: principal.userId,
-    conversationId: ctx.payload.conversationId,
-    callId: ctx.payload.callId,
-    candidate: ctx.payload.candidate,
-    at: Date.now(),
-  });
-
-  return { ok: true };
-}
-
-export async function onCallHangup(ctx: {
-  server: Server;
-  client: AuthedSocket;
-  payload: CallHangupPayload;
-  limiter: RateLimitService;
-  convClient: DjangoConversationClient;
-}) {
-  const principal = requirePrincipal(ctx.client);
-
-  ctx.limiter.assert(principal.userId, 'call');
-  await ctx.convClient.assertConversationMemberOrThrow(principal.userId, ctx.payload.conversationId);
-
-  ctx.server.to(rooms.userRoom(ctx.payload.toUserId)).emit(CALL_EVT.CALL_HANGUP, {
-    fromUserId: principal.userId,
-    conversationId: ctx.payload.conversationId,
-    callId: ctx.payload.callId,
-    reason: ctx.payload.reason ?? 'hangup',
-    at: Date.now(),
-  });
-
-  return { ok: true };
+  socket.on(EVT.CALL_OFFER, (payload: any, ack?: (a: Ack<any>) => void) => forward(EVT.CALL_OFFER, payload, ack))
+  socket.on(EVT.CALL_ANSWER, (payload: any, ack?: (a: Ack<any>) => void) => forward(EVT.CALL_ANSWER, payload, ack))
+  socket.on(EVT.CALL_ICE, (payload: any, ack?: (a: Ack<any>) => void) => forward(EVT.CALL_ICE, payload, ack))
+  socket.on(EVT.CALL_END, (payload: any, ack?: (a: Ack<any>) => void) => forward(EVT.CALL_END, payload, ack))
 }

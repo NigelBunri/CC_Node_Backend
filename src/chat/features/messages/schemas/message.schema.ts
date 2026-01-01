@@ -76,6 +76,8 @@ class Poll {
   @Prop({ required: true }) question!: string;
   @Prop({ type: [PollOptionSchema], default: [] }) options!: PollOption[];
   @Prop() allowMultiple?: boolean;
+
+  // ✅ Avoid union ambiguity in @nestjs/mongoose
   @Prop({ type: Date, default: null })
   expiresAt?: Date | null;
 }
@@ -158,6 +160,10 @@ export class Message {
     enum: ['text', 'voice', 'styled_text', 'sticker', 'system', 'contacts', 'poll', 'event'],
   })
   kind!: MessageKind;
+
+  /* ----- Batch B: Threads wiring ----- */
+  @Prop({ index: true })
+  threadId?: string;
 
   /* ----- Batch A fields ----- */
 
@@ -253,3 +259,13 @@ MessageSchema.index({ conversationId: 1, clientId: 1 }, { unique: true });
 
 // Common sort/filter
 MessageSchema.index({ conversationId: 1, createdAt: -1 });
+
+// ✅ Threads timeline queries
+MessageSchema.index({ conversationId: 1, threadId: 1, seq: 1 });
+MessageSchema.index({ conversationId: 1, threadId: 1, createdAt: -1 });
+
+// ✅ Full-text search
+MessageSchema.index(
+  { text: 'text', previewText: 'text' },
+  { weights: { text: 10, previewText: 3 }, name: 'MessageTextSearch' },
+);

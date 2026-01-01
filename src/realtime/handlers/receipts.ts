@@ -1,64 +1,62 @@
-import { Server, Socket } from 'socket.io';
+// src/realtime/handlers/receipts.ts
 
-import { EVT, rooms, SocketPrincipal } from '../../chat/chat.types';
-import { RateLimitService } from '../../chat/infra/rate-limit/rate-limit.service';
-import { DjangoConversationClient } from '../../chat/integrations/django/django-conversation.client';
-import { ReceiptsService } from '../../chat/features/receipts/receipts.service';
+import type { Server, Socket } from 'socket.io'
+import { EVT, rooms, type Ack, type ReceiptPayload, type SocketPrincipal } from '../../chat/chat.types'
+import { getPrincipal, ok, err, safeAck, safeEmit } from './utils'
 
-import { requirePrincipal, resolveDeviceId } from './utils';
-
-type AuthedSocket = Socket & { principal?: SocketPrincipal };
-
-export type WsReceiptPayload = {
-  conversationId: string;
-  messageId: string;
-  type: 'delivered' | 'read' | 'played';
-  atMs?: number;
-};
-
-function toReceiptDTO(message: any) {
-  return {
-    deliveredTo: message.deliveredTo ?? [],
-    readBy: message.readBy ?? [],
-    playedBy: message.playedBy ?? [],
-  };
+export interface ReceiptsDeps {
+  rateLimitService: {
+    assert(principal: SocketPrincipal, key: string, limit?: number): Promise<void> | void
+  }
+  djangoConversationClient: {
+    assertMember(principal: SocketPrincipal, conversationId: string): Promise<any>
+  }
+  moderationService?: {
+    assertAllowed(args: { conversationId: string; userId: string; action: 'receipt' }): Promise<void> | void
+  }
+  receiptsService: {
+    applyReceipt(args: {
+      userId: string
+      conversationId: string
+      messageId: string
+      type: 'delivered' | 'read' | 'played'
+      deviceId?: string
+    }): Promise<any>
+  }
 }
 
-export async function onReceipt(ctx: {
-  server: Server;
-  client: AuthedSocket;
-  payload: WsReceiptPayload;
-  limiter: RateLimitService;
-  convClient: DjangoConversationClient;
-  receipts: ReceiptsService;
-}) {
-  const principal = requirePrincipal(ctx.client);
-  const deviceId = resolveDeviceId(ctx.client);
+export function registerReceiptHandlers(server: Server, socket: Socket, deps: ReceiptsDeps) {
+  socket.on(EVT.RECEIPT, async (payload: ReceiptPayload, ack?: (a: Ack<any>) => void) => {
+    const principal = getPrincipal(socket)
+    const { conversationId, messageId, type } = payload || ({} as any)
 
-  ctx.limiter.assert(principal.userId, 'receipt');
-  await ctx.convClient.assertConversationMemberOrThrow(principal.userId, ctx.payload.conversationId);
+    if (!conversationId || !messageId || !type) {
+      return safeAck(ack, err('conversationId, messageId, type are required', 'BAD_REQUEST'))
+    }
 
-  const updated = await ctx.receipts.addReceipt({
-    conversationId: ctx.payload.conversationId,
-    messageId: ctx.payload.messageId,
-    userId: principal.userId,
-    deviceId,
-    type: ctx.payload.type,
-    atMs: ctx.payload.atMs,
-  });
+    try {
+      await deps.rateLimitService.assert(principal, `receipt:${conversationId}`, 200)
+      await deps.djangoConversationClient.assertMember(principal, conversationId)
+      if (deps.moderationService) {
+        await deps.moderationService.assertAllowed({
+          conversationId,
+          userId: principal.userId,
+          action: 'receipt',
+        })
+      }
 
-  const dto = toReceiptDTO(updated);
+      const receiptEvent = await deps.receiptsService.applyReceipt({
+        userId: principal.userId,
+        conversationId,
+        messageId,
+        type,
+        deviceId: principal.deviceId,
+      })
 
-  const eventPayload = {
-    conversationId: ctx.payload.conversationId,
-    messageId: ctx.payload.messageId,
-    deliveredTo: dto.deliveredTo,
-    readBy: dto.readBy,
-    playedBy: dto.playedBy,
-  };
-
-  ctx.server.to(rooms.convRoom(ctx.payload.conversationId)).emit(EVT.MESSAGE_RECEIPT, eventPayload);
-  ctx.server.to(rooms.userRoom(principal.userId)).emit(EVT.MESSAGE_RECEIPT, eventPayload);
-
-  return { ok: true };
+      safeEmit(server, rooms.convRoom(conversationId), EVT.MESSAGE_RECEIPT, receiptEvent)
+      safeAck(ack, ok({ receipt: true }))
+    } catch (e: any) {
+      safeAck(ack, err(e?.message ?? 'Receipt failed', 'ERROR'))
+    }
+  })
 }

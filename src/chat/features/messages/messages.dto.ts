@@ -3,19 +3,17 @@
 import {
   IsArray,
   IsBoolean,
-  IsIn,
   IsInt,
-  IsNumber,
-  IsObject,
   IsOptional,
   IsString,
   Max,
   Min,
   ValidateNested,
   ArrayMaxSize,
+  IsIn,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import type { MessageKind } from '../../chat.types';
+import { MESSAGE_KINDS, type MessageKind, type MessageKindValue } from '../../chat.types';
 
 export class AttachmentDto {
   @IsString() id!: string;
@@ -36,7 +34,6 @@ export class AttachmentDto {
 
 export class StyledTextDto {
   @IsString() text!: string;
-
   @IsString() backgroundColor!: string;
 
   @IsInt() @Min(10) @Max(120)
@@ -91,6 +88,7 @@ export class PollDto {
   @IsOptional() @IsBoolean()
   allowMultiple?: boolean;
 
+  // Keep string here; schema stores Date|null, service can map/ignore
   @IsOptional() @IsString()
   expiresAt?: string | null;
 }
@@ -117,41 +115,32 @@ export class SendMessageDto {
   @IsString() conversationId!: string;
   @IsString() clientId!: string;
 
-  @IsIn([
-    'text',
-    'voice',
-    'styled_text',
-    'sticker',
-    'system',
-    'contacts',
-    'poll',
-    'event',
-  ] satisfies MessageKind[])
-  kind!: MessageKind;
+  @IsIn(MESSAGE_KINDS as readonly string[])
+  kind: MessageKindValue
 
-  // Plain text
+  // ✅ Batch B: optional thread routing
+  @IsOptional()
+  @IsString()
+  threadId?: string;
+
   @IsOptional() @IsString()
   text?: string;
 
-  // Styled text
   @IsOptional()
   @ValidateNested()
   @Type(() => StyledTextDto)
   styledText?: StyledTextDto;
 
-  // Voice metadata
   @IsOptional()
   @ValidateNested()
   @Type(() => VoiceDto)
   voice?: VoiceDto;
 
-  // Sticker payload
   @IsOptional()
   @ValidateNested()
   @Type(() => StickerDto)
   sticker?: StickerDto;
 
-  // Attachments
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(20)
@@ -159,7 +148,6 @@ export class SendMessageDto {
   @Type(() => AttachmentDto)
   attachments?: AttachmentDto[];
 
-  // Contacts
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(50)
@@ -167,13 +155,11 @@ export class SendMessageDto {
   @Type(() => ContactDto)
   contacts?: ContactDto[];
 
-  // Poll
   @IsOptional()
   @ValidateNested()
   @Type(() => PollDto)
   poll?: PollDto;
 
-  // Event
   @IsOptional()
   @ValidateNested()
   @Type(() => EventDto)

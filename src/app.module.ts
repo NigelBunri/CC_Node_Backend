@@ -1,12 +1,20 @@
+// src/app.module.ts
+
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
 
-import { AuthModule } from './auth/auth.module';
-import { GatewayModule } from './realtime/gateway.module';
-import { MessagesModule } from './chat/features/messages/messages.module';
-import { PresenceModule } from './chat/features/presence/presence.module';
+// ✅ Use canonical ChatModule
+import { ChatModule } from './chat/chat.module';
+
+// Optional: if PresenceModule is separate in your structure and not already inside ChatModule
+// import { PresenceModule } from './chat/features/presence/presence.module';
+
 import { UploadsModule } from './uploads/uploads.module';
+
+// ✅ Observability + health
+import { ObservabilityModule } from './observability/observability.module';
+import { HealthModule } from './health/health.module';
 
 @Module({
   imports: [
@@ -19,18 +27,20 @@ import { UploadsModule } from './uploads/uploads.module';
         const uri = cfg.get<string>('MONGODB_URI') ?? '';
         const env = (cfg.get<string>('NODE_ENV') || 'development').toLowerCase();
 
-        const isSrv = uri.startsWith('mongodb+srv://');     // Atlas-style SRV
-        const directConnection = !isSrv;                    // single host (local, docker, VM, etc.)
+        const isSrv = uri.startsWith('mongodb+srv://');
+        const directConnection = !isSrv;
+
         const dbFromUri = (() => {
           try {
-            // If URI looks like mongodb://host:port/dbname extract dbname
             const m = uri.match(/^mongodb(?:\+srv)?:\/\/[^/]+\/([^?]+)/i);
             return m?.[1];
-          } catch { return undefined; }
+          } catch {
+            return undefined;
+          }
         })();
+
         const dbName = dbFromUri || cfg.get<string>('MONGODB_DB') || 'kis';
 
-        // Masked URI for logs (avoid printing secrets)
         const masked = uri.replace(/:\/\/([^:]+):([^@]+)@/, '://$1:*****@');
         if (env !== 'production') {
           console.log('[BOOT] MONGODB_URI =', masked);
@@ -39,32 +49,25 @@ import { UploadsModule } from './uploads/uploads.module';
         return {
           uri,
           dbName,
-          // Timeouts
           serverSelectionTimeoutMS: 8000,
-
-          // Local/single-node fast path; driver skips replica discovery
           directConnection,
-
-          // TLS only for SRV/Atlas (local dev is usually non-TLS)
           tls: isSrv,
-          ssl: isSrv, // alias; harmless
-
-          // Reasonable pool for dev; tune as needed
+          ssl: isSrv,
           maxPoolSize: 10,
-
-          // Nice for dev, safer off in prod
           autoIndex: env !== 'production',
-
-          // Helps identify your app in server logs/Atlas
           appName: 'kis-backend',
         };
       },
     }),
 
-    AuthModule,
-    PresenceModule,
-    MessagesModule,
-    GatewayModule,
+    // ✅ cross-cutting
+    ObservabilityModule,
+    HealthModule,
+
+    // ✅ core
+    ChatModule,
+
+    // ✅ uploads
     UploadsModule,
   ],
 })

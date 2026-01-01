@@ -1,27 +1,36 @@
 // src/realtime/handlers/utils.ts
 
-import { Server, Socket } from 'socket.io';
-import { EVT, rooms, SocketPrincipal } from '../../chat/chat.types';
+import type { Server, Socket } from 'socket.io'
+import type { Ack, AckErr, AckOk, SocketPrincipal } from '../../chat/chat.types'
 
-export const convRoom = rooms.convRoom;
-export const userRoom = rooms.userRoom;
+export type AnyAckFn = (ack: Ack<any>) => void
 
-export function requirePrincipal(client: Socket & { principal?: SocketPrincipal }): SocketPrincipal {
-  const p = client.principal;
-  if (!p?.userId) throw new Error('unauthorized');
-  return p;
+export function ok<T>(data: T): AckOk<T> {
+  return { ok: true, data }
 }
 
-/**
- * Resolve a device id for receipts/edits/etc.
- * - Prefer principal.deviceId if provided
- * - Else fallback to socket.id for uniqueness
- */
-export function resolveDeviceId(client: Socket & { principal?: SocketPrincipal }): string {
-  const fromPrincipal = client.principal?.deviceId;
-  return fromPrincipal && fromPrincipal.trim().length ? fromPrincipal : `socket:${client.id}`;
+export function err(message: string, code?: string): AckErr {
+  return { ok: false, error: message, code }
 }
 
-export function emitPresence(server: Server, userId: string, state: 'online' | 'offline') {
-  server.emit(EVT.PRESENCE, { userId, state, at: Date.now() });
+export function safeAck<T>(ack: AnyAckFn | undefined, payload: Ack<T>) {
+  try {
+    if (typeof ack === 'function') ack(payload)
+  } catch {
+    // never throw from ack path
+  }
+}
+
+export function getPrincipal(socket: Socket): SocketPrincipal {
+  const p = (socket as any).principal as SocketPrincipal | undefined
+  if (!p?.userId) throw new Error('Missing socket principal')
+  return p
+}
+
+export function safeEmit(server: Server, room: string, event: string, payload: any) {
+  try {
+    server.to(room).emit(event, payload)
+  } catch {
+    // never throw from emit path
+  }
 }

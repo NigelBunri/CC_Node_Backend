@@ -1,5 +1,3 @@
-// src/chat/features/pins/pins.service.ts
-
 import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
@@ -7,25 +5,60 @@ import { Pin, PinDocument } from './pin.schema';
 
 @Injectable()
 export class PinsService {
-  constructor(@InjectModel(Pin.name) private readonly model: Model<PinDocument>) {}
+  constructor(
+    @InjectModel(Pin.name) private readonly pinModel: Model<PinDocument>,
+  ) {}
 
-  async setPinned(params: { conversationId: string; messageId: string; userId: string; pinned: boolean }) {
-    const { conversationId, messageId, userId, pinned } = params;
+  /**
+   * Idempotent pin/unpin.
+   * Returns the resulting pinned state.
+   */
+  async setPinned(input: {
+    conversationId: string;
+    messageId: string;
+    userId: string;
+    pinned: boolean;
+  }): Promise<{ pinned: boolean }> {
+    const { conversationId, messageId, userId, pinned } = input;
 
     if (pinned) {
-      await this.model.updateOne(
-        { conversationId, messageId },
-        { $setOnInsert: { conversationId, messageId, pinnedBy: userId } },
-        { upsert: true },
-      );
+      try {
+        await this.pinModel.create({
+          conversationId,
+          messageId,
+          pinnedBy: userId,
+        });
+      } catch (e: any) {
+        // ignore duplicate key errors (idempotent)
+        if (e?.code !== 11000) throw e;
+      }
       return { pinned: true };
     }
 
-    await this.model.deleteOne({ conversationId, messageId });
+    await this.pinModel.deleteOne({ conversationId, messageId });
     return { pinned: false };
   }
 
-  async listPinned(conversationId: string, limit = 50) {
-    return this.model.find({ conversationId }).sort({ createdAt: -1 }).limit(limit).exec();
+  /**
+   * Optional helper: list pinned message IDs (most recent first).
+   * Useful for client bootstrap or "Pinned messages" screen.
+   */
+  async listPinnedMessageIds(input: {
+    conversationId: string;
+    limit?: number;
+    before?: string; // ISO date string
+  }): Promise<{ messageIds: string[] }> {
+    const limit = Math.min(Math.max(input.limit ?? 50, 1), 200);
+
+    const q: any = { conversationId: input.conversationId };
+    if (input.before) q.createdAt = { $lt: new Date(input.before) };
+
+    const rows = await this.pinModel
+      .find(q)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .select({ messageId: 1 });
+
+    return { messageIds: rows.map(r => String(r.messageId)) };
   }
 }

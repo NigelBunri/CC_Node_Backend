@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
-import { Pin, PinSchema } from './pin.schema';
 import { PinsService } from './pins.service';
+import { Pin, PinSchema } from './pin.schema';
 
 @Module({
   imports: [MongooseModule.forFeature([{ name: Pin.name, schema: PinSchema }])],

@@ -1,73 +1,58 @@
-import { Socket } from 'socket.io';
+// src/realtime/handlers/sync.ts
 
-import { EVT, SocketPrincipal } from '../../chat/chat.types';
-import { RateLimitService } from '../../chat/infra/rate-limit/rate-limit.service';
-import { DjangoConversationClient } from '../../chat/integrations/django/django-conversation.client';
-import { SyncService } from '../../chat/features/sync/sync.service';
+import type { Server, Socket } from 'socket.io'
+import { EVT, type Ack, type GapCheckPayload, type GapFillPayload, type SocketPrincipal } from '../../chat/chat.types'
+import { getPrincipal, ok, err, safeAck } from './utils'
 
-import { requirePrincipal } from './utils';
-
-type AuthedSocket = Socket & { principal?: SocketPrincipal };
-
-export type WsGapCheckPayload = {
-  conversationId: string;
-  fromSeq: number;
-  toSeq: number;
-};
-
-export async function onGapCheck(ctx: {
-  client: AuthedSocket;
-  payload: WsGapCheckPayload;
-  limiter: RateLimitService;
-  convClient: DjangoConversationClient;
-  sync: SyncService;
-}) {
-  const principal = requirePrincipal(ctx.client);
-
-  ctx.limiter.assert(principal.userId, 'gap');
-  await ctx.convClient.assertConversationMemberOrThrow(principal.userId, ctx.payload.conversationId);
-
-  const out = await ctx.sync.gapCheck(ctx.payload.conversationId, ctx.payload.fromSeq, ctx.payload.toSeq);
-
-  if (out.missing?.length) {
-    const dtos = (out.messages ?? []).map((m: any) => ({
-      id: String(m._id ?? m.id ?? m.serverId),
-      conversationId: m.conversationId,
-      seq: m.seq,
-      clientId: m.clientId,
-      senderId: m.senderId,
-      senderDeviceId: m.senderDeviceId,
-      kind: m.kind,
-      ciphertext: m.ciphertext,
-      encryptionMeta: m.encryptionMeta,
-      text: m.text,
-      attachments: m.attachments ?? [],
-      reply: m.reply,
-      forward: m.forward,
-      mentions: m.mentions,
-      linkPreview: m.linkPreview,
-      poll: m.poll,
-      ephemeral: m.ephemeral,
-      edited: !!m.edited,
-      editedAt: m.editedAt,
-      deleteState: m.deleteState,
-      deletedAt: m.deletedAt,
-      deletedBy: m.deletedBy,
-      reactions: m.reactions ?? [],
-      deliveredTo: m.deliveredTo ?? [],
-      readBy: m.readBy ?? [],
-      playedBy: m.playedBy ?? [],
-      createdAt: m.createdAt,
-      updatedAt: m.updatedAt,
-    }));
-
-    ctx.client.emit(EVT.GAP_FILL, {
-      conversationId: ctx.payload.conversationId,
-      fromSeq: ctx.payload.fromSeq,
-      toSeq: ctx.payload.toSeq,
-      messages: dtos,
-    });
+export interface SyncDeps {
+  rateLimitService: {
+    assert(principal: SocketPrincipal, key: string, limit?: number): Promise<void> | void
   }
+  djangoConversationClient: {
+    assertMember(principal: SocketPrincipal, conversationId: string): Promise<any>
+  }
+  syncService: {
+    findMissingSeqs(args: { conversationId: string; haveSeqs: number[] }): Promise<number[]>
+    getRange(args: { conversationId: string; seqs: number[] }): Promise<any[]>
+  }
+}
 
-  return { ok: true, missing: out.missing ?? [] };
+export function registerSyncHandlers(server: Server, socket: Socket, deps: SyncDeps) {
+  socket.on(EVT.GAP_CHECK, async (payload: GapCheckPayload, ack?: (a: Ack<any>) => void) => {
+    const principal = getPrincipal(socket)
+    const conversationId = payload?.conversationId
+
+    if (!conversationId) return safeAck(ack, err('conversationId is required', 'BAD_REQUEST'))
+
+    try {
+      await deps.rateLimitService.assert(principal, `gap_check:${conversationId}`, 30)
+      await deps.djangoConversationClient.assertMember(principal, conversationId)
+
+      const haveSeqs = Array.isArray(payload?.haveSeqs) ? payload.haveSeqs : []
+      const missingSeqs = await deps.syncService.findMissingSeqs({ conversationId, haveSeqs })
+
+      safeAck(ack, ok({ missingSeqs }))
+    } catch (e: any) {
+      safeAck(ack, err(e?.message ?? 'Gap check failed', 'ERROR'))
+    }
+  })
+
+  socket.on(EVT.GAP_FILL, async (payload: GapFillPayload, ack?: (a: Ack<any>) => void) => {
+    const principal = getPrincipal(socket)
+    const conversationId = payload?.conversationId
+
+    if (!conversationId) return safeAck(ack, err('conversationId is required', 'BAD_REQUEST'))
+
+    try {
+      await deps.rateLimitService.assert(principal, `gap_fill:${conversationId}`, 20)
+      await deps.djangoConversationClient.assertMember(principal, conversationId)
+
+      const missingSeqs = Array.isArray(payload?.missingSeqs) ? payload.missingSeqs : []
+      const messages = await deps.syncService.getRange({ conversationId, seqs: missingSeqs })
+
+      safeAck(ack, ok({ messages }))
+    } catch (e: any) {
+      safeAck(ack, err(e?.message ?? 'Gap fill failed', 'ERROR'))
+    }
+  })
 }

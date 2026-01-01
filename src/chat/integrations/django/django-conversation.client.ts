@@ -1,42 +1,108 @@
 // src/chat/integrations/django/django-conversation.client.ts
 
-import { Injectable, UnauthorizedException } from '@nestjs/common';
-import axios from 'axios';
-import { ConversationPermission, SocketPrincipal } from '../../chat.types';
+import { Injectable, UnauthorizedException } from '@nestjs/common'
+import { HttpService } from '@nestjs/axios'
+import { firstValueFrom } from 'rxjs'
+import { SocketPrincipal, ConversationPermission } from '../../chat.types'
 
-function ensureTrailingSlash(u: string) {
-  return u.endsWith('/') ? u : u + '/';
+export interface DjangoWsPermsResponse {
+  isMember: boolean
+  isBlocked: boolean
+  role?: string
+  scopes?: ConversationPermission[]
 }
 
 @Injectable()
 export class DjangoConversationClient {
-  async assertConversationMemberOrThrow(userId: string, conversationId: string) {
-    const internal = process.env.DJANGO_INTERNAL_TOKEN!;
-    const rawUrl = process.env.DJANGO_CONV_PERMS_URL!;
-    const url = ensureTrailingSlash(rawUrl).replace('{conversationId}', conversationId);
+  constructor(private readonly http: HttpService) {}
 
-    const { data } = await axios.get(url, {
-      headers: { 'X-Internal-Auth': internal, Accept: 'application/json', 'X-User-Id': userId },
-      timeout: 4000,
-    });
+  /**
+   * Fetch conversation-scoped permissions from Django
+   *
+   * Django endpoint:
+   *   GET /api/v1/chat/conversations/{conversationId}/ws-perms/
+   *
+   * Headers:
+   *   Authorization: Bearer <JWT>
+   *   X-Internal-Auth: <DJANGO_INTERNAL_TOKEN>
+   */
+  async wsPerms(
+    principal: SocketPrincipal,
+    conversationId: string,
+  ): Promise<DjangoWsPermsResponse> {
+    const url = process.env.DJANGO_CONV_PERMS_URL?.replace(
+      '{conversationId}',
+      conversationId,
+    )
 
-    // Accept either {isMember:true} or Django-like payload
-    const isMember = Boolean(data?.isMember ?? data?.member ?? data?.ok);
-    const isBlocked = Boolean(data?.isBlocked ?? data?.blocked);
-    const dmState = (data?.dmState ?? data?.dm_state) as ConversationPermission['dmState'] | undefined;
+    if (!url) {
+      throw new Error('DJANGO_CONV_PERMS_URL is not configured')
+    }
 
-    if (!isMember || isBlocked || dmState === 'pending') {
-      throw new UnauthorizedException('Not allowed');
+    const headers: Record<string, string> = {
+      'X-Internal-Auth': process.env.DJANGO_INTERNAL_TOKEN ?? '',
+    }
+    if (principal.token) {
+      headers.Authorization = `Bearer ${principal.token}`
+    }
+
+    try {
+      const res = await firstValueFrom(
+        this.http.get<DjangoWsPermsResponse>(url, {
+          headers,
+          params: { userId: principal.userId },
+        }),
+      )
+
+      return res.data
+    } catch (err) {
+      throw new UnauthorizedException('Conversation permission check failed')
     }
   }
 
-  // ✅ handlers/messages.ts expects wsPerms(...)
-  async wsPerms(conversationId: string, principal: SocketPrincipal): Promise<ConversationPermission> {
-    try {
-      await this.assertConversationMemberOrThrow(principal.userId, conversationId);
-      return { isMember: true, isBlocked: false, dmState: 'accepted', scopes: principal.scopes };
-    } catch {
-      return { isMember: false, isBlocked: true };
+  /**
+   * Convenience guard:
+   * - must be member
+   * - must not be blocked
+   */
+  async assertMember(
+    principal: SocketPrincipal,
+    conversationId: string,
+  ): Promise<DjangoWsPermsResponse> {
+    const perms = await this.wsPerms(principal, conversationId)
+
+    if (!perms.isMember) {
+      throw new UnauthorizedException('Not a conversation member')
     }
+
+    if (perms.isBlocked) {
+      throw new UnauthorizedException('Conversation is blocked')
+    }
+
+    return perms
+  }
+
+  async updateLastMessage(args: { conversationId: string; createdAt: Date; preview?: string }) {
+    const base = process.env.DJANGO_API_URL
+    const url =
+      process.env.DJANGO_CONV_UPDATE_LAST_MESSAGE_URL
+      ?? (base ? `${base}/chat/conversations/${args.conversationId}/update-last-message/` : undefined)
+
+    if (!url) return
+
+    await firstValueFrom(
+      this.http.patch(
+        url,
+        {
+          last_message_at: args.createdAt.toISOString(),
+          last_message_preview: (args.preview ?? '').slice(0, 255),
+        },
+        {
+          headers: {
+            'X-Internal-Auth': process.env.DJANGO_INTERNAL_TOKEN ?? '',
+          },
+        },
+      ),
+    )
   }
 }

@@ -1,5 +1,3 @@
-// src/chat/features/stars/star.schema.ts
-
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument } from 'mongoose';
 
@@ -13,13 +11,14 @@ export class Star {
   @Prop({ required: true, index: true })
   conversationId!: string;
 
-  @Prop({ required: true })
+  @Prop({ required: true, index: true })
   messageId!: string;
-
-  createdAt!: Date;
-  updatedAt!: Date;
 }
 
 export const StarSchema = SchemaFactory.createForClass(Star);
+
+// One star per user per message
 StarSchema.index({ userId: 1, conversationId: 1, messageId: 1 }, { unique: true });
-StarSchema.index({ userId: 1, createdAt: -1 });
+
+// Fast list queries
+StarSchema.index({ userId: 1, conversationId: 1, createdAt: -1 });

@@ -1,59 +1,60 @@
-import { Server, Socket } from 'socket.io';
+// src/realtime/handlers/reactions.ts
 
-import { EVT, rooms, SocketPrincipal } from '../../chat/chat.types';
-import { RateLimitService } from '../../chat/infra/rate-limit/rate-limit.service';
-import { DjangoConversationClient } from '../../chat/integrations/django/django-conversation.client';
-import { ReactionsService } from '../../chat/features/reactions/reactions.service';
+import type { Server, Socket } from 'socket.io'
+import { EVT, rooms, type Ack, type ReactionPayload, type SocketPrincipal } from '../../chat/chat.types'
+import { getPrincipal, ok, err, safeAck, safeEmit } from './utils'
 
-import { requirePrincipal } from './utils';
-
-type AuthedSocket = Socket & { principal?: SocketPrincipal };
-
-export type WsReactionPayload = {
-  conversationId: string;
-  messageId: string;
-  emoji: string;
-  mode: 'add' | 'remove';
-};
-
-function toMessageDTO(message: any) {
-  return {
-    reactions: message.reactions ?? [],
-  };
+export interface ReactionsDeps {
+  rateLimitService: {
+    assert(principal: SocketPrincipal, key: string, limit?: number): Promise<void> | void
+  }
+  djangoConversationClient: {
+    assertMember(principal: SocketPrincipal, conversationId: string): Promise<any>
+  }
+  moderationService?: {
+    assertAllowed(args: { conversationId: string; userId: string; action: 'react' }): Promise<void> | void
+  }
+  reactionsService: {
+    toggleReaction(args: {
+      userId: string
+      conversationId: string
+      messageId: string
+      emoji: string
+    }): Promise<any>
+  }
 }
 
-export async function onReact(ctx: {
-  server: Server;
-  client: AuthedSocket;
-  payload: WsReactionPayload;
-  limiter: RateLimitService;
-  convClient: DjangoConversationClient;
-  reactions: ReactionsService;
-}) {
-  const principal = requirePrincipal(ctx.client);
+export function registerReactionHandlers(server: Server, socket: Socket, deps: ReactionsDeps) {
+  socket.on(EVT.REACT, async (payload: ReactionPayload, ack?: (a: Ack<any>) => void) => {
+    const principal = getPrincipal(socket)
+    const { conversationId, messageId, emoji } = payload || ({} as any)
 
-  ctx.limiter.assert(principal.userId, 'react');
-  await ctx.convClient.assertConversationMemberOrThrow(principal.userId, ctx.payload.conversationId);
+    if (!conversationId || !messageId || !emoji) {
+      return safeAck(ack, err('conversationId, messageId, emoji are required', 'BAD_REQUEST'))
+    }
 
-  const updated = await ctx.reactions.react({
-    conversationId: ctx.payload.conversationId,
-    messageId: ctx.payload.messageId,
-    userId: principal.userId,
-    emoji: ctx.payload.emoji,
-    mode: ctx.payload.mode,
-    nowMs: Date.now(),
-  });
+    try {
+      await deps.rateLimitService.assert(principal, `react:${conversationId}`, 120)
+      await deps.djangoConversationClient.assertMember(principal, conversationId)
+      if (deps.moderationService) {
+        await deps.moderationService.assertAllowed({
+          conversationId,
+          userId: principal.userId,
+          action: 'react',
+        })
+      }
 
-  const dto = toMessageDTO(updated);
+      const reactionEvent = await deps.reactionsService.toggleReaction({
+        userId: principal.userId,
+        conversationId,
+        messageId,
+        emoji,
+      })
 
-  const eventPayload = {
-    conversationId: ctx.payload.conversationId,
-    messageId: ctx.payload.messageId,
-    reactions: dto.reactions,
-  };
-
-  ctx.server.to(rooms.convRoom(ctx.payload.conversationId)).emit(EVT.MESSAGE_REACTION, eventPayload);
-  ctx.server.to(rooms.userRoom(principal.userId)).emit(EVT.MESSAGE_REACTION, eventPayload);
-
-  return { ok: true, reactions: dto.reactions };
+      safeEmit(server, rooms.convRoom(conversationId), EVT.MESSAGE_REACTION, reactionEvent)
+      safeAck(ack, ok({ reacted: true }))
+    } catch (e: any) {
+      safeAck(ack, err(e?.message ?? 'React failed', 'ERROR'))
+    }
+  })
 }

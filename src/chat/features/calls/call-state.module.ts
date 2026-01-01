@@ -1,10 +1,10 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
-import { CallSession, CallSessionSchema } from './call-session.schema';
 import { CallStateService } from './call-state.service';
+import { CallState, CallStateSchema } from './schemas/call-state.schema';
 
 @Module({
-  imports: [MongooseModule.forFeature([{ name: CallSession.name, schema: CallSessionSchema }])],
+  imports: [MongooseModule.forFeature([{ name: CallState.name, schema: CallStateSchema }])],
   providers: [CallStateService],
   exports: [CallStateService],
 })

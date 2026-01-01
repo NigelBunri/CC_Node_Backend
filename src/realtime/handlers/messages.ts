@@ -1,121 +1,226 @@
-// src/realtime/handlers/messages.handlers.ts
+// src/realtime/handlers/messages.ts
 
-import { BadRequestException } from '@nestjs/common';
-import { Socket } from 'socket.io';
+import type { Server, Socket } from 'socket.io'
+import {
+  EVT,
+  rooms,
+  type Ack,
+  type HistoryPayload,
+  type SendMessageAck,
+  type SendMessagePayload,
+  type EditMessagePayload,
+  type SocketPrincipal,
+} from '../../chat/chat.types'
+import { getPrincipal, ok, err, safeAck, safeEmit } from './utils'
 
-import { EVT, Ack, SendMessageAck } from '../../chat/chat.types';
-import { SendMessageDto } from '../../chat/features/messages/messages.dto';
-
-import { MessagesService } from '../../chat/features/messages/messages.service';
-import { DjangoConversationClient } from '../../chat/integrations/django/django-conversation.client';
-import { DjangoSeqClient } from '../../chat/integrations/django/django-seq.client';
-import { RateLimitService } from '../../chat/infra/rate-limit/rate-limit.service';
-
-import { convRoom } from './utils';
-
-function ackErr(code: string, message: string, details?: any) {
-  return { ok: false, error: { code, message, details } } as const;
-}
-function ackOk<T>(data: T) {
-  return { ok: true, data } as const;
-}
-
-export class MessagesHandlers {
-  constructor(
-    private readonly messages: MessagesService,
-    private readonly perms: DjangoConversationClient,
-    private readonly seq: DjangoSeqClient,
-    private readonly rate: RateLimitService,
-  ) {}
-
-  /**
-   * Handle WS send message:
-   * - auth principal already attached by WsAuthGuard
-   * - ws-perms check
-   * - rate limit
-   * - allocate seq via Django
-   * - idempotent save by (conversationId, clientId)
-   * - emit chat.message
-   */
-  async onSendMessage(io: any, socket: Socket, body: SendMessageDto): Promise<Ack<SendMessageAck>> {
-    const principal = socket.principal;
-    if (!principal) return ackErr('AUTH_REQUIRED', 'Missing principal');
-
-    // Basic guard
-    if (!body?.conversationId || !body?.clientId || !body?.kind) {
-      return ackErr('VALIDATION_FAILED', 'Missing required fields');
-    }
-
-    // Permission gate
-    try {
-      const p = await this.perms.wsPerms(body.conversationId, principal);
-      if (!p?.isMember) return ackErr('FORBIDDEN', 'Not a member');
-      if (p?.isBlocked) return ackErr('FORBIDDEN', 'Conversation is blocked');
-      if (p?.dmState === 'pending') return ackErr('FORBIDDEN', 'DM request pending');
-    } catch (e: any) {
-      return ackErr('DJANGO_UNAVAILABLE', 'Permission check failed', { reason: e?.message });
-    }
-
-    // Rate limit
-    try {
-      this.rate.assertAllowed({
-        key: `send:${principal.userId}`,
-        limit: 25,
-        windowMs: 5000,
-      });
-    } catch {
-      return ackErr('RATE_LIMITED', 'Too many messages');
-    }
-
-    // Allocate seq
-    let seq: number;
-    try {
-      seq = await this.seq.allocate(body.conversationId);
-      if (!Number.isFinite(seq) || seq <= 0) throw new Error('bad seq');
-    } catch (e: any) {
-      return ackErr('DJANGO_UNAVAILABLE', 'Sequence allocation failed', { reason: e?.message });
-    }
-
-    // Save (idempotent)
-    try {
-      const doc = await this.messages.createIdempotent({
-        senderId: principal.userId,
-        seq,
-        input: body,
-      });
-
-      // Emit to conversation room
-      io.to(convRoom(body.conversationId)).emit(EVT.MESSAGE, {
-        serverId: String(doc._id),
-        clientId: doc.clientId,
-        conversationId: doc.conversationId,
-        seq: doc.seq,
-        senderId: doc.senderId,
-        kind: doc.kind,
-        text: doc.text,
-        styledText: doc.styledText,
-        voice: doc.voice,
-        sticker: doc.sticker,
-        attachments: doc.attachments,
-        contacts: doc.contacts,
-        poll: doc.poll,
-        event: doc.event,
-        replyToId: doc.replyToId,
-        isEdited: doc.isEdited,
-        isDeleted: doc.isDeleted,
-        createdAt: doc.createdAt?.toISOString?.() ?? new Date().toISOString(),
-        updatedAt: doc.updatedAt?.toISOString?.(),
-      });
-
-      return ackOk({
-        clientId: doc.clientId,
-        serverId: String(doc._id),
-        seq: doc.seq,
-        createdAt: doc.createdAt?.toISOString?.() ?? new Date().toISOString(),
-      });
-    } catch (e: any) {
-      const msg = e instanceof BadRequestException ? e.message : 'Send failed';
-      return ackErr('SEND_FAILED', msg, { reason: e?.message });
-    }
+export interface MessagesDeps {
+  rateLimitService: {
+    assert(principal: SocketPrincipal, key: string, limit?: number): Promise<void> | void
   }
+  djangoConversationClient: {
+    assertMember(principal: SocketPrincipal, conversationId: string): Promise<any>
+    updateLastMessage(args: { conversationId: string; createdAt: Date; preview?: string }): Promise<void>
+  }
+  moderationService?: {
+    assertAllowed(args: {
+      conversationId: string
+      userId: string
+      action: 'send' | 'edit' | 'delete'
+    }): Promise<void> | void
+  }
+  djangoSeqClient: {
+    allocateSeq(conversationId: string): Promise<number>
+    // compatibility alias if your client uses allocate()
+    allocate?: (conversationId: string) => Promise<number>
+  }
+  messagesService: {
+    // idempotent create with rich payload
+    createIdempotent(args: {
+      senderId: string
+      senderDeviceId?: string
+      conversationId: string
+      clientId: string
+      seq: number
+      input: SendMessagePayload
+    }): Promise<{
+      id: string
+      seq: number
+      createdAt: Date
+      dto: any
+    }>
+
+    editMessage(args: {
+      senderId: string
+      conversationId: string
+      messageId: string
+      input: EditMessagePayload
+    }): Promise<any>
+
+    deleteMessage(args: {
+      senderId: string
+      conversationId: string
+      messageId: string
+    }): Promise<any>
+
+    listRecent(args: {
+      conversationId: string
+      limit?: number
+      before?: string
+      after?: string
+    }): Promise<any[]>
+  }
+}
+
+export function registerMessageHandlers(server: Server, socket: Socket, deps: MessagesDeps) {
+  socket.on(EVT.SEND, async (payload: SendMessagePayload, ack?: (a: Ack<{ ack: SendMessageAck }>) => void) => {
+    const principal = getPrincipal(socket)
+
+    const conversationId = payload?.conversationId
+    const clientId = payload?.clientId
+
+    if (!conversationId || !clientId) {
+      return safeAck(ack, err('conversationId and clientId are required', 'BAD_REQUEST'))
+    }
+
+    try {
+      await deps.rateLimitService.assert(principal, `send:${conversationId}`, 50)
+      await deps.djangoConversationClient.assertMember(principal, conversationId)
+      if (deps.moderationService) {
+        await deps.moderationService.assertAllowed({
+          conversationId,
+          userId: principal.userId,
+          action: 'send',
+        })
+      }
+
+      const allocate = deps.djangoSeqClient.allocateSeq ?? deps.djangoSeqClient.allocate
+      if (!allocate) throw new Error('Seq allocator not configured')
+
+      const seq = await allocate(conversationId)
+
+      const created = await deps.messagesService.createIdempotent({
+        senderId: principal.userId,
+        senderDeviceId: principal.deviceId,
+        conversationId,
+        clientId,
+        seq,
+        input: payload,
+      })
+
+      try {
+        const preview = created.dto?.previewText ?? created.dto?.text ?? payload?.text
+        await deps.djangoConversationClient.updateLastMessage({
+          conversationId,
+          createdAt: created.createdAt,
+          preview,
+        })
+      } catch {}
+
+      // Fan-out to the conversation room
+      safeEmit(server, rooms.convRoom(conversationId), EVT.MESSAGE, created.dto)
+
+      const ackPayload: SendMessageAck = {
+        clientId,
+        serverId: created.id,
+        seq: created.seq,
+        createdAt: created.createdAt.toISOString(),
+      }
+
+      safeAck(ack, ok({ ack: ackPayload }))
+    } catch (e: any) {
+      safeAck(ack, err(e?.message ?? 'Send failed', 'ERROR'))
+    }
+  })
+
+  socket.on(EVT.EDIT, async (payload: EditMessagePayload, ack?: (a: Ack<any>) => void) => {
+    const principal = getPrincipal(socket)
+    const conversationId = payload?.conversationId
+    const messageId = payload?.messageId
+
+    if (!conversationId || !messageId) {
+      return safeAck(ack, err('conversationId and messageId are required', 'BAD_REQUEST'))
+    }
+
+    try {
+      await deps.rateLimitService.assert(principal, `edit:${conversationId}`, 60)
+      await deps.djangoConversationClient.assertMember(principal, conversationId)
+      if (deps.moderationService) {
+        await deps.moderationService.assertAllowed({
+          conversationId,
+          userId: principal.userId,
+          action: 'edit',
+        })
+      }
+
+      const updated = await deps.messagesService.editMessage({
+        senderId: principal.userId,
+        conversationId,
+        messageId,
+        input: payload,
+      })
+
+      safeEmit(server, rooms.convRoom(conversationId), EVT.EDIT, updated)
+      safeAck(ack, ok({ updated: true }))
+    } catch (e: any) {
+      safeAck(ack, err(e?.message ?? 'Edit failed', 'ERROR'))
+    }
+  })
+
+  socket.on(EVT.DELETE, async (payload: { conversationId: string; messageId: string }, ack?: (a: Ack<any>) => void) => {
+    const principal = getPrincipal(socket)
+    const conversationId = payload?.conversationId
+    const messageId = payload?.messageId
+
+    if (!conversationId || !messageId) {
+      return safeAck(ack, err('conversationId and messageId are required', 'BAD_REQUEST'))
+    }
+
+    try {
+      await deps.rateLimitService.assert(principal, `delete:${conversationId}`, 60)
+      await deps.djangoConversationClient.assertMember(principal, conversationId)
+      if (deps.moderationService) {
+        await deps.moderationService.assertAllowed({
+          conversationId,
+          userId: principal.userId,
+          action: 'delete',
+        })
+      }
+
+      const deleted = await deps.messagesService.deleteMessage({
+        senderId: principal.userId,
+        conversationId,
+        messageId,
+      })
+
+      safeEmit(server, rooms.convRoom(conversationId), EVT.DELETE, deleted)
+      safeAck(ack, ok({ deleted: true }))
+    } catch (e: any) {
+      safeAck(ack, err(e?.message ?? 'Delete failed', 'ERROR'))
+    }
+  })
+
+  socket.on(EVT.HISTORY, async (payload: HistoryPayload, ack?: (a: Ack<any>) => void) => {
+    const principal = getPrincipal(socket)
+    const conversationId = payload?.conversationId
+
+    if (!conversationId) {
+      return safeAck(ack, err('conversationId is required', 'BAD_REQUEST'))
+    }
+
+    try {
+      await deps.rateLimitService.assert(principal, `history:${conversationId}`, 30)
+      await deps.djangoConversationClient.assertMember(principal, conversationId)
+
+      const items = await deps.messagesService.listRecent({
+        conversationId,
+        limit: payload?.limit,
+        before: payload?.before,
+        after: payload?.after,
+      })
+
+      safeAck(ack, ok({ messages: items }))
+    } catch (e: any) {
+      safeAck(ack, err(e?.message ?? 'History failed', 'ERROR'))
+    }
+  })
 }
