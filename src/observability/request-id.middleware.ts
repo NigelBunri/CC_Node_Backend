@@ -5,6 +5,11 @@ export function requestIdMiddleware(req: FastifyRequest, res: FastifyReply, next
   const incoming = (req.headers['x-request-id'] as string | undefined) ?? '';
   const id = incoming || randomUUID();
   (req as any).requestId = id;
-  res.header('x-request-id', id);
+  const replyAny = res as any;
+  if (typeof replyAny.header === 'function') {
+    replyAny.header('x-request-id', id);
+  } else if (typeof replyAny.setHeader === 'function') {
+    replyAny.setHeader('x-request-id', id);
+  }
   next();
 }

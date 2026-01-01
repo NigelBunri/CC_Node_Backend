@@ -25,10 +25,13 @@ import { ChatGateway } from '../realtime/chat.gateway'
 // Batch B modules
 import { ThreadsModule } from './features/threads/threads.module'
 import { PinsModule } from './features/pins/pins.module'
+import { PinsController } from './features/pins/pins.controller'
 import { StarsModule } from './features/stars/stars.module'
 import { ModerationModule } from './features/moderation/moderation.module'
+import { ModerationController } from './features/moderation/moderation.controller'
 import { CallsModule } from './features/calls/calls.module'
 import { SearchModule } from './features/search/search.module'
+import { CallsController } from './features/calls/calls.controller'
 
 // ✅ Notifications
 import { NotificationsModule } from '../notifications/notifications.module'
@@ -56,6 +59,7 @@ import { CallStateModule } from './features/calls/call-state.module'
     NotificationsModule,
     CallStateModule,
   ],
+  controllers: [ModerationController, CallsController, PinsController],
   providers: [
     ChatGateway,
     WsAuthGuard,

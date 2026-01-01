@@ -76,6 +76,46 @@ export class CallsService {
     )
   }
 
+  async listUserCalls(input: {
+    userId: string
+    limit?: number
+    before?: string
+  }): Promise<{ calls: any[] }> {
+    const limit = Math.min(Math.max(input.limit ?? 50, 1), 200)
+    const q: any = {
+      $or: [
+        { createdBy: input.userId },
+        { 'participants.userId': input.userId },
+      ],
+    }
+    if (input.before) {
+      const before = new Date(input.before)
+      if (!Number.isNaN(before.getTime())) {
+        q.startedAt = { $lt: before }
+      }
+    }
+
+    const rows = await this.calls
+      .find(q)
+      .sort({ startedAt: -1 })
+      .limit(limit)
+      .lean()
+
+    return {
+      calls: rows.map((r: any) => ({
+        id: String(r._id),
+        conversationId: r.conversationId,
+        callId: r.callId,
+        createdBy: r.createdBy,
+        status: r.status,
+        media: r.media,
+        startedAt: r.startedAt?.toISOString?.() ?? String(r.startedAt),
+        endedAt: r.endedAt?.toISOString?.() ?? (r.endedAt ? String(r.endedAt) : null),
+        participants: Array.isArray(r.participants) ? r.participants : [],
+      })),
+    }
+  }
+
   async createCallOrThrowIfActiveInConversation(args: UpsertCallArgs): Promise<CallSession> {
     const now = new Date()
 
