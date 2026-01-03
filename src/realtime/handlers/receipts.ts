@@ -53,6 +53,11 @@ export function registerReceiptHandlers(server: Server, socket: Socket, deps: Re
         deviceId: principal.deviceId,
       })
 
+      const receiptConvId = (receiptEvent as any)?.conversationId
+      if (receiptConvId && String(receiptConvId) !== String(conversationId)) {
+        throw new Error('Conversation mismatch on receipt')
+      }
+
       safeEmit(server, rooms.convRoom(conversationId), EVT.MESSAGE_RECEIPT, receiptEvent)
       safeAck(ack, ok({ receipt: true }))
     } catch (e: any) {

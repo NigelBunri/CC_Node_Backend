@@ -109,6 +109,9 @@ export class EventDto {
 
   @IsOptional() @IsString()
   endsAt?: string;
+
+  @IsOptional() @IsInt() @Min(0)
+  reminderMinutes?: number;
 }
 
 export class SendMessageDto {

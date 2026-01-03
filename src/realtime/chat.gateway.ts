@@ -25,6 +25,7 @@ import { SyncService } from '../chat/features/sync/sync.service'
 import { CallsService } from '../chat/features/calls/calls.service'
 import { ModerationService } from '../chat/features/moderation/moderation.service'
 import { PresenceService } from '../chat/features/presence/presence.service'
+import { NotificationsService } from '../notifications/notifications.service'
 import { registerRealtimeHandlers } from './handlers'
 
 @WebSocketGateway({
@@ -49,6 +50,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private readonly callsService: CallsService,
     private readonly moderationService: ModerationService,
     private readonly presenceService: PresenceService,
+    private readonly notificationsService: NotificationsService,
     private readonly authService: DjangoAuthService,
   ) {}
 
@@ -100,6 +102,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       syncService: this.syncService,
       callsService: this.callsService,
       moderationService: this.moderationService,
+      notificationsService: this.notificationsService,
+      presenceService: this.presenceService,
     })
   }
 

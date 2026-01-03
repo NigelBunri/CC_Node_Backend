@@ -63,4 +63,19 @@ export class PresenceService {
       this.lastSeen.set(userId, now);
     }
   }
+
+  async isOnline(userId: string): Promise<boolean> {
+    const redis = this.getRedis();
+    if (redis) {
+      try {
+        const raw = await redis.get(`presence:${userId}:count`);
+        const count = raw ? Number(raw) : 0;
+        return count > 0;
+      } catch {
+        // fall through to in-memory on redis failure
+      }
+    }
+
+    return (this.counts.get(userId) ?? 0) > 0;
+  }
 }

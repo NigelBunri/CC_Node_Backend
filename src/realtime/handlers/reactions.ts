@@ -51,6 +51,11 @@ export function registerReactionHandlers(server: Server, socket: Socket, deps: R
         emoji,
       })
 
+      const reactionConvId = (reactionEvent as any)?.conversationId
+      if (reactionConvId && String(reactionConvId) !== String(conversationId)) {
+        throw new Error('Conversation mismatch on reaction')
+      }
+
       safeEmit(server, rooms.convRoom(conversationId), EVT.MESSAGE_REACTION, reactionEvent)
       safeAck(ack, ok({ reacted: true }))
     } catch (e: any) {

@@ -21,6 +21,8 @@ import { DjangoSeqClient } from './integrations/django/django-seq.client'
 import { RateLimitService } from './infra/rate-limit/rate-limit.service'
 
 import { ChatGateway } from '../realtime/chat.gateway'
+import { RealtimeInternalController } from '../realtime/internal.controller'
+import { InternalAuthGuard } from '../auth/internal-auth.guard'
 
 // Batch B modules
 import { ThreadsModule } from './features/threads/threads.module'
@@ -59,10 +61,16 @@ import { CallStateModule } from './features/calls/call-state.module'
     NotificationsModule,
     CallStateModule,
   ],
-  controllers: [ModerationController, CallsController, PinsController],
+  controllers: [
+    ModerationController,
+    CallsController,
+    PinsController,
+    RealtimeInternalController,
+  ],
   providers: [
     ChatGateway,
     WsAuthGuard,
+    InternalAuthGuard,
 
     // Batch A services
     MessagesService,

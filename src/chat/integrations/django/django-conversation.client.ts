@@ -12,6 +12,11 @@ export interface DjangoWsPermsResponse {
   scopes?: ConversationPermission[]
 }
 
+export interface DjangoMemberIdsResponse {
+  user_ids?: string[]
+  userIds?: string[]
+}
+
 @Injectable()
 export class DjangoConversationClient {
   constructor(private readonly http: HttpService) {}
@@ -104,5 +109,25 @@ export class DjangoConversationClient {
         },
       ),
     )
+  }
+
+  async listMemberIds(conversationId: string): Promise<string[]> {
+    const base = process.env.DJANGO_API_URL
+    const url =
+      process.env.DJANGO_CONV_MEMBER_IDS_URL
+      ?? (base ? `${base}/chat/conversations/${conversationId}/member-ids/` : undefined)
+
+    if (!url) return []
+
+    const res = await firstValueFrom(
+      this.http.get<DjangoMemberIdsResponse>(url, {
+        headers: {
+          'X-Internal-Auth': process.env.DJANGO_INTERNAL_TOKEN ?? '',
+        },
+      }),
+    )
+
+    const data = res?.data ?? {}
+    return (data.user_ids ?? data.userIds ?? []).map((id) => String(id))
   }
 }

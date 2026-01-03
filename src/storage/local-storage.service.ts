@@ -9,7 +9,7 @@ import { randomUUID } from 'crypto';
 export class LocalStorageService extends StorageService {
   driver(): 'local' | 's3' { return 'local'; }
 
-  async storeLocal(file: { buffer: Buffer; filename: string; mime: string; size: number }): Promise<StoredFile> {
+  async storeLocal(file: { buffer: Buffer; filename: string; mime: string; size: number; publicBase?: string }): Promise<StoredFile> {
     const dir = process.env.UPLOADS_DIR || 'uploads';
     const safeName = file.filename.replace(/[^\w.\-]+/g, '_'); // sanitize
     const key = `${new Date().toISOString().slice(0,10)}/${randomUUID()}-${safeName}`;
@@ -24,7 +24,7 @@ export class LocalStorageService extends StorageService {
       ws.end(file.buffer);
     });
 
-    const base = process.env.PUBLIC_BASE || 'http://localhost:4000/uploads';
+    const base = file.publicBase || process.env.PUBLIC_BASE || 'http://localhost:4000/uploads';
     return { key, url: `${base}/${encodeURIComponent(key)}`, name: file.filename, mime: file.mime || 'application/octet-stream', size: file.size };
   }
 }

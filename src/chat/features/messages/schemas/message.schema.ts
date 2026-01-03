@@ -91,6 +91,7 @@ class EventPayload {
   @Prop() location?: string;
   @Prop({ required: true }) startsAt!: string;
   @Prop() endsAt?: string;
+  @Prop({ min: 0 }) reminderMinutes?: number;
 }
 const EventPayloadSchema = SchemaFactory.createForClass(EventPayload);
 

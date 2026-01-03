@@ -20,6 +20,7 @@ export interface MessagesDeps {
   djangoConversationClient: {
     assertMember(principal: SocketPrincipal, conversationId: string): Promise<any>
     updateLastMessage(args: { conversationId: string; createdAt: Date; preview?: string }): Promise<void>
+    listMemberIds?: (conversationId: string) => Promise<string[]>
   }
   moderationService?: {
     assertAllowed(args: {
@@ -69,6 +70,19 @@ export interface MessagesDeps {
       after?: string
     }): Promise<any[]>
   }
+  notificationsService?: {
+    notifyNewMessage(input: {
+      toUserId: string
+      conversationId: string
+      messageId: string
+      preview?: string
+      senderName?: string
+      senderId?: string
+    }): Promise<any>
+  }
+  presenceService?: {
+    isOnline(userId: string): Promise<boolean>
+  }
 }
 
 export function registerMessageHandlers(server: Server, socket: Socket, deps: MessagesDeps) {
@@ -107,6 +121,12 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
         input: payload,
       })
 
+      const createdConvId =
+        (created as any)?.dto?.conversationId ?? (created as any)?.conversationId
+      if (createdConvId && String(createdConvId) !== String(conversationId)) {
+        throw new Error('Conversation mismatch on create')
+      }
+
       try {
         const preview = created.dto?.previewText ?? created.dto?.text ?? payload?.text
         await deps.djangoConversationClient.updateLastMessage({
@@ -118,6 +138,26 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
 
       // Fan-out to the conversation room
       safeEmit(server, rooms.convRoom(conversationId), EVT.MESSAGE, created.dto)
+
+      try {
+        const listMembers = deps.djangoConversationClient.listMemberIds
+        if (listMembers && deps.notificationsService) {
+          const memberIds = await listMembers(conversationId)
+          for (const userId of memberIds) {
+            if (String(userId) === String(principal.userId)) continue
+            const isOnline = await deps.presenceService?.isOnline?.(String(userId))
+            if (isOnline) continue
+            await deps.notificationsService.notifyNewMessage({
+              toUserId: String(userId),
+              conversationId,
+              messageId: created.id,
+              preview: created.dto?.previewText ?? created.dto?.text ?? payload?.text,
+              senderName: principal.username ?? undefined,
+              senderId: principal.userId,
+            })
+          }
+        }
+      } catch {}
 
       const ackPayload: SendMessageAck = {
         clientId,
@@ -159,6 +199,11 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
         input: payload,
       })
 
+      const updatedConvId = (updated as any)?.conversationId
+      if (updatedConvId && String(updatedConvId) !== String(conversationId)) {
+        throw new Error('Conversation mismatch on edit')
+      }
+
       safeEmit(server, rooms.convRoom(conversationId), EVT.EDIT, updated)
       safeAck(ack, ok({ updated: true }))
     } catch (e: any) {
@@ -191,6 +236,11 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
         conversationId,
         messageId,
       })
+
+      const deletedConvId = (deleted as any)?.conversationId
+      if (deletedConvId && String(deletedConvId) !== String(conversationId)) {
+        throw new Error('Conversation mismatch on delete')
+      }
 
       safeEmit(server, rooms.convRoom(conversationId), EVT.DELETE, deleted)
       safeAck(ack, ok({ deleted: true }))

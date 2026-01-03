@@ -10,7 +10,6 @@ export class UploadsController {
 
   @Post('file')
   async upload(@Req() req: FastifyRequest) {
-    console.log("✅ sending the file ")
     // Parse a single file via @fastify/multipart
     // (FastifyRequest doesn't know .file() unless you wire generics; simplest is cast)
     const mp: any = await (req as any).file();
@@ -31,12 +30,30 @@ export class UploadsController {
       return { error: 'File too large' };
     }
 
+    const host = req.headers?.host;
+    const proto =
+      (req.headers?.['x-forwarded-proto'] as string) ||
+      (req as any).protocol ||
+      'http';
+    const publicBase = host ? `${proto}://${host}/uploads` : undefined;
+
     const stored = await this.local.storeLocal({
       buffer,
       filename: mp.filename,
       mime: mp.mimetype || 'application/octet-stream',
       size,
+      publicBase,
     });
+
+    const kind = (() => {
+      const mime = stored.mime || '';
+      if (mime.startsWith('image/')) return 'image';
+      if (mime.startsWith('video/')) return 'video';
+      if (mime.startsWith('audio/')) return 'audio';
+      if (mime.includes('pdf') || mime.includes('msword') || mime.includes('officedocument'))
+        return 'document';
+      return 'other';
+    })();
 
     return {
       ok: true,
@@ -45,7 +62,10 @@ export class UploadsController {
         url: stored.url,
         name: stored.name,
         mime: stored.mime,
+        originalName: stored.name,
+        mimeType: stored.mime,
         size: stored.size,
+        kind,
       },
     };
   }

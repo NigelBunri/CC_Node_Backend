@@ -1,16 +1,19 @@
 import { Injectable } from '@nestjs/common';
 import { DeviceTokensService } from './device-tokens.service';
+import { createFcmProvider } from './fcm.provider';
 import { DummyPushProvider, PushMessage, PushProvider } from './push.provider';
 
 export type PushTarget = { userId: string; deviceTokens?: string[] };
 
 @Injectable()
 export class NotificationsService {
-  private readonly provider: PushProvider = new DummyPushProvider();
+  private readonly provider: PushProvider;
 
   constructor(
     private readonly tokens: DeviceTokensService,
-  ) {}
+  ) {
+    this.provider = createFcmProvider() ?? new DummyPushProvider();
+  }
 
   async notify(target: PushTarget, msg: PushMessage) {
     const tokens = target.deviceTokens?.length
@@ -34,13 +37,28 @@ export class NotificationsService {
     );
   }
 
-  async notifyNewMessage(input: { toUserId: string; conversationId: string; messageId: string; preview?: string }) {
+  async notifyNewMessage(input: {
+    toUserId: string;
+    conversationId: string;
+    messageId: string;
+    preview?: string;
+    senderName?: string;
+    senderId?: string;
+  }) {
+    const title =
+      (input.senderName && String(input.senderName).trim()) ||
+      'New message';
+    const body = input.preview ?? 'New message';
     return this.notify(
       { userId: input.toUserId },
       {
-        title: 'New message',
-        body: input.preview ?? 'New message',
-        data: { conversationId: input.conversationId, messageId: input.messageId },
+        title,
+        body,
+        data: {
+          conversationId: input.conversationId,
+          messageId: input.messageId,
+          senderId: input.senderId ?? '',
+        },
       },
     );
   }
