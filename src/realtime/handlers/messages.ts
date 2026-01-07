@@ -98,7 +98,10 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
 
     try {
       await deps.rateLimitService.assert(principal, `send:${conversationId}`, 50)
-      await deps.djangoConversationClient.assertMember(principal, conversationId)
+      const perms = await deps.djangoConversationClient.assertMember(principal, conversationId)
+      if (perms?.canSend === false) {
+        throw new Error('You are not allowed to send messages in this channel')
+      }
       if (deps.moderationService) {
         await deps.moderationService.assertAllowed({
           conversationId,

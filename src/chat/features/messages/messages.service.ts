@@ -45,6 +45,8 @@ export class MessagesService {
       threadId: (input as any).threadId,
 
       text: input.text,
+      ciphertext: (input as any).ciphertext,
+      encryptionMeta: (input as any).encryptionMeta,
       styledText: input.styledText,
       voice: input.voice,
       sticker: input.sticker,
@@ -323,6 +325,20 @@ export class MessagesService {
 
   private assertKindPayloadConsistency(input: SendMessageDto) {
     const kind = input.kind as any
+    const hasEncryptedPayload = !!((input as any).ciphertext || (input as any).encryptionMeta)
+
+    const allowedKinds = new Set([
+      'text',
+      'styled_text',
+      'voice',
+      'sticker',
+      'contacts',
+      'poll',
+      'event',
+      'system',
+    ])
+    if (!allowedKinds.has(kind)) throw new BadRequestException(`Unsupported kind: ${String(kind)}`)
+    if (hasEncryptedPayload) return
 
     const hasText = !!(input.text && input.text.trim().length)
     const hasStyled = !!(input as any).styledText
@@ -358,8 +374,6 @@ export class MessagesService {
       case 'system':
         if (!hasText) throw new BadRequestException('system requires text')
         break
-      default:
-        throw new BadRequestException(`Unsupported kind: ${String(kind)}`)
     }
 
     if (kind !== 'styled_text' && hasStyled) throw new BadRequestException('styledText not allowed for this kind')
@@ -371,6 +385,9 @@ export class MessagesService {
   }
 
   private buildPreview(input: SendMessageDto): string | undefined {
+    if (!input.text && ((input as any).ciphertext || (input as any).encryptionMeta)) {
+      return '🔒 Encrypted message'
+    }
     switch (input.kind as any) {
       case 'text':
         return input.text?.slice(0, 200)

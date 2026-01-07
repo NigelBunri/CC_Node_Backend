@@ -6,6 +6,7 @@ export type AuthPrincipal = {
   userId: string;
   username: string;
   isPremium: boolean;
+  deviceId?: string;
   scopes?: string[];
 };
 
@@ -77,7 +78,9 @@ export class DjangoAuthService {
             ? Object.keys(data.entitlements).filter(k => data.entitlements[k] === true)
             : [];
 
-      return { userId, username, isPremium, scopes };
+      const deviceId = data?.device_id ?? data?.deviceId ?? undefined;
+
+      return { userId, username, isPremium, deviceId: deviceId ? String(deviceId) : undefined, scopes };
     } catch (e) {
       const err = e as AxiosError;
       const status = err.response?.status;

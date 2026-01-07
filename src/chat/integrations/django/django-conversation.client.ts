@@ -9,6 +9,7 @@ export interface DjangoWsPermsResponse {
   isMember: boolean
   isBlocked: boolean
   role?: string
+  canSend?: boolean
   scopes?: ConversationPermission[]
 }
 
@@ -20,6 +21,11 @@ export interface DjangoMemberIdsResponse {
 @Injectable()
 export class DjangoConversationClient {
   constructor(private readonly http: HttpService) {}
+  private readonly permsCache = new Map<
+    string,
+    { expiresAt: number; data: DjangoWsPermsResponse }
+  >()
+  private readonly permsTtlMs = Number(process.env.DJANGO_CONV_PERMS_TTL_MS ?? 8000)
 
   /**
    * Fetch conversation-scoped permissions from Django
@@ -35,6 +41,13 @@ export class DjangoConversationClient {
     principal: SocketPrincipal,
     conversationId: string,
   ): Promise<DjangoWsPermsResponse> {
+    const tokenHash = principal.token ? principal.token.slice(-8) : 'anon'
+    const cacheKey = `${principal.userId}:${conversationId}:${tokenHash}`
+    const now = Date.now()
+    const cached = this.permsCache.get(cacheKey)
+    if (cached && cached.expiresAt > now) {
+      return cached.data
+    }
     const url = process.env.DJANGO_CONV_PERMS_URL?.replace(
       '{conversationId}',
       conversationId,
@@ -59,7 +72,12 @@ export class DjangoConversationClient {
         }),
       )
 
-      return res.data
+      const data = res.data
+      this.permsCache.set(cacheKey, {
+        expiresAt: now + this.permsTtlMs,
+        data,
+      })
+      return data
     } catch (err) {
       throw new UnauthorizedException('Conversation permission check failed')
     }

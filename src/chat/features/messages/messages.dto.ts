@@ -11,6 +11,7 @@ import {
   ValidateNested,
   ArrayMaxSize,
   IsIn,
+  IsObject,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { MESSAGE_KINDS, type MessageKind, type MessageKindValue } from '../../chat.types';
@@ -128,6 +129,12 @@ export class SendMessageDto {
 
   @IsOptional() @IsString()
   text?: string;
+
+  @IsOptional() @IsString()
+  ciphertext?: string;
+
+  @IsOptional() @IsObject()
+  encryptionMeta?: Record<string, any>;
 
   @IsOptional()
   @ValidateNested()
