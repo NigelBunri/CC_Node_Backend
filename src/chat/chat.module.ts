@@ -34,6 +34,7 @@ import { ModerationController } from './features/moderation/moderation.controlle
 import { CallsModule } from './features/calls/calls.module'
 import { SearchModule } from './features/search/search.module'
 import { CallsController } from './features/calls/calls.controller'
+import { BroadcastsController } from './features/broadcasts/broadcasts.controller'
 
 // ✅ Notifications
 import { NotificationsModule } from '../notifications/notifications.module'
@@ -65,6 +66,7 @@ import { CallStateModule } from './features/calls/call-state.module'
     ModerationController,
     CallsController,
     PinsController,
+    BroadcastsController,
     RealtimeInternalController,
   ],
   providers: [

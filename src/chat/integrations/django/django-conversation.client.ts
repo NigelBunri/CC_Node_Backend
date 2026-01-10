@@ -18,6 +18,13 @@ export interface DjangoMemberIdsResponse {
   userIds?: string[]
 }
 
+export interface DjangoPolicyCheckResponse {
+  allowed: boolean
+  reason?: string
+  matches?: string[]
+  warn?: string[]
+}
+
 @Injectable()
 export class DjangoConversationClient {
   constructor(private readonly http: HttpService) {}
@@ -147,5 +154,65 @@ export class DjangoConversationClient {
 
     const data = res?.data ?? {}
     return (data.user_ids ?? data.userIds ?? []).map((id) => String(id))
+  }
+
+  async policyCheck(args: {
+    principal: SocketPrincipal
+    conversationId: string
+    action: 'send' | 'edit' | 'delete'
+    text?: string
+  }): Promise<DjangoPolicyCheckResponse> {
+    const base = process.env.DJANGO_API_URL
+    const url =
+      process.env.DJANGO_CONV_POLICY_CHECK_URL
+      ?? (base ? `${base}/chat/conversations/${args.conversationId}/policy-check/` : undefined)
+
+    if (!url) return { allowed: true }
+
+    const headers: Record<string, string> = {
+      'X-Internal-Auth': process.env.DJANGO_INTERNAL_TOKEN ?? '',
+    }
+    if (args.principal.token) {
+      headers.Authorization = `Bearer ${args.principal.token}`
+    }
+
+    const res = await firstValueFrom(
+      this.http.post<DjangoPolicyCheckResponse>(
+        url,
+        {
+          action: args.action,
+          userId: args.principal.userId,
+          text: args.text ?? '',
+        },
+        { headers },
+      ),
+    )
+    return res?.data ?? { allowed: true }
+  }
+
+  async dispatchWebhook(args: {
+    conversationId: string
+    event: string
+    payload?: Record<string, any>
+  }): Promise<{ delivered: number }> {
+    const base = process.env.DJANGO_API_URL
+    const url =
+      process.env.DJANGO_CONV_WEBHOOK_DISPATCH_URL
+      ?? (base ? `${base}/chat/conversations/${args.conversationId}/webhook-dispatch/` : undefined)
+
+    if (!url) return { delivered: 0 }
+
+    const res = await firstValueFrom(
+      this.http.post<{ delivered: number }>(
+        url,
+        { event: args.event, payload: args.payload ?? {} },
+        {
+          headers: {
+            'X-Internal-Auth': process.env.DJANGO_INTERNAL_TOKEN ?? '',
+          },
+        },
+      ),
+    )
+    return res?.data ?? { delivered: 0 }
   }
 }

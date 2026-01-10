@@ -297,6 +297,50 @@ export class MessagesService {
     return rows.reverse()
   }
 
+  async listRecentForConversations(args: {
+    conversationIds: string[]
+    limit?: number
+    since?: Date
+  }): Promise<any[]> {
+    const ids = Array.isArray(args.conversationIds)
+      ? args.conversationIds.map((id) => String(id)).filter(Boolean)
+      : []
+    if (!ids.length) return []
+
+    const limit = Math.min(Math.max(args.limit ?? 100, 1), 500)
+    const query: any = {
+      conversationId: { $in: ids },
+      isDeleted: { $ne: true },
+    }
+    if (args.since instanceof Date && !isNaN(args.since.getTime())) {
+      query.createdAt = { $gte: args.since }
+    }
+
+    return this.messageModel
+      .find(query)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean()
+      .exec()
+  }
+
+  async listByIds(args: { messageIds: string[]; conversationId?: string }): Promise<any[]> {
+    const ids = Array.isArray(args.messageIds)
+      ? args.messageIds.map((id) => String(id)).filter(Boolean)
+      : []
+    if (!ids.length) return []
+
+    const query: any = { _id: { $in: ids }, isDeleted: { $ne: true } }
+    if (args.conversationId) {
+      query.conversationId = String(args.conversationId)
+    }
+
+    return this.messageModel
+      .find(query)
+      .lean()
+      .exec()
+  }
+
   /**
    * ✅ Handlers expect: findMissingSeqs({ conversationId, haveSeqs })
    * We'll compute missing between min(have) and max(have).

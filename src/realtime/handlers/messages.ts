@@ -21,6 +21,17 @@ export interface MessagesDeps {
     assertMember(principal: SocketPrincipal, conversationId: string): Promise<any>
     updateLastMessage(args: { conversationId: string; createdAt: Date; preview?: string }): Promise<void>
     listMemberIds?: (conversationId: string) => Promise<string[]>
+    policyCheck?: (args: {
+      principal: SocketPrincipal
+      conversationId: string
+      action: 'send' | 'edit' | 'delete'
+      text?: string
+    }) => Promise<{ allowed: boolean; reason?: string; matches?: string[]; warn?: string[] }>
+    dispatchWebhook: (args: {
+      conversationId: string
+      event: string
+      payload?: Record<string, any>
+    }) => Promise<{ delivered: number }>
   }
   moderationService?: {
     assertAllowed(args: {
@@ -109,6 +120,17 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
           action: 'send',
         })
       }
+      if (deps.djangoConversationClient.policyCheck) {
+        const policy = await deps.djangoConversationClient.policyCheck({
+          principal,
+          conversationId,
+          action: 'send',
+          text: payload?.text ?? '',
+        })
+        if (policy?.allowed === false) {
+          throw new Error(policy.reason || 'Policy blocked this message')
+        }
+      }
 
       const allocate = deps.djangoSeqClient.allocateSeq ?? deps.djangoSeqClient.allocate
       if (!allocate) throw new Error('Seq allocator not configured')
@@ -141,6 +163,16 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
 
       // Fan-out to the conversation room
       safeEmit(server, rooms.convRoom(conversationId), EVT.MESSAGE, created.dto)
+      try {
+        await deps.djangoConversationClient.dispatchWebhook({
+          conversationId,
+          event: 'message.created',
+          payload: {
+            messageId: created.id,
+            senderId: principal.userId,
+          },
+        })
+      } catch {}
 
       try {
         const listMembers = deps.djangoConversationClient.listMemberIds
@@ -194,6 +226,17 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
           action: 'edit',
         })
       }
+      if (deps.djangoConversationClient.policyCheck) {
+        const policy = await deps.djangoConversationClient.policyCheck({
+          principal,
+          conversationId,
+          action: 'edit',
+          text: payload?.text ?? '',
+        })
+        if (policy?.allowed === false) {
+          throw new Error(policy.reason || 'Policy blocked this edit')
+        }
+      }
 
       const updated = await deps.messagesService.editMessage({
         senderId: principal.userId,
@@ -208,6 +251,16 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
       }
 
       safeEmit(server, rooms.convRoom(conversationId), EVT.EDIT, updated)
+      try {
+        await deps.djangoConversationClient.dispatchWebhook({
+          conversationId,
+          event: 'message.edited',
+          payload: {
+            messageId,
+            senderId: principal.userId,
+          },
+        })
+      } catch {}
       safeAck(ack, ok({ updated: true }))
     } catch (e: any) {
       safeAck(ack, err(e?.message ?? 'Edit failed', 'ERROR'))
@@ -233,6 +286,16 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
           action: 'delete',
         })
       }
+      if (deps.djangoConversationClient.policyCheck) {
+        const policy = await deps.djangoConversationClient.policyCheck({
+          principal,
+          conversationId,
+          action: 'delete',
+        })
+        if (policy?.allowed === false) {
+          throw new Error(policy.reason || 'Policy blocked this delete')
+        }
+      }
 
       const deleted = await deps.messagesService.deleteMessage({
         senderId: principal.userId,
@@ -246,6 +309,16 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
       }
 
       safeEmit(server, rooms.convRoom(conversationId), EVT.DELETE, deleted)
+      try {
+        await deps.djangoConversationClient.dispatchWebhook({
+          conversationId,
+          event: 'message.deleted',
+          payload: {
+            messageId,
+            senderId: principal.userId,
+          },
+        })
+      } catch {}
       safeAck(ack, ok({ deleted: true }))
     } catch (e: any) {
       safeAck(ack, err(e?.message ?? 'Delete failed', 'ERROR'))
