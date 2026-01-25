@@ -21,6 +21,11 @@
     "noImplicitAny": false,
     "strictBindCallApply": false,
     "noFallthroughCasesInSwitch": false,
-    "types": ["node", "socket.io", "./src/types/socket.d.ts"]
+    "types": [
+      "node",
+      "socket.io",
+      "./src/types/socket.d.ts",
+      "./src/types/fastify.d.ts"
+    ]
   }
 }

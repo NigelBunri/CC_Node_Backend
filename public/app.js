@@ -1,439 +1,456 @@
-// ===== helpers =====
-const $ = (id) => document.getElementById(id);
-const nowTime = () => new Date().toLocaleTimeString();
-const base64Decode = (b64) => { try { return decodeURIComponent(escape(atob(String(b64).replace(/^BASE64:/,'')))); } catch { return b64; } };
-const ensureString = (x) => (typeof x === 'string' ? x : JSON.stringify(x));
-const sizeStr = (n) => n>=1024*1024 ? (n/1024/1024).toFixed(1)+' MB' : n>=1024 ? (n/1024).toFixed(1)+' KB' : n+' B';
-const SIDES = ['A','B','C','D'];
+const SECTIONS = [
+  {
+    id: 'community',
+    title: 'Community Feed',
+    description: 'People-powered updates from the field team.',
+  },
+  {
+    id: 'partner',
+    title: 'Partner Feed',
+    description: 'Partner announcements and product highlights.',
+  },
+  {
+    id: 'broadcast',
+    title: 'Broadcast',
+    description: 'Live stream shout-outs and viewer questions.',
+  },
+]
 
-function mkClientId(){ return 'c_' + Date.now() + '_' + Math.random().toString(36).slice(2); }
-function hashStr(str){ let h=0; for (let i=0;i<str.length;i++) h=((h*31)+str.charCodeAt(i))|0; return String(h); }
-function sideLogBox(side){ return side==='A'?'logsA':side==='B'?'logsB':side==='C'?'logsC':'logsD'; }
-
-function appendBubble({ threadId, who, text, mine }) {
-  if (!text) return;
-  const thread = document.getElementById(threadId); if (!thread) return;
-  const wrap = document.createElement('div');
-  wrap.className = `msg ${mine ? 'me' : 'other'}`;
-  wrap.innerText = text;
-  const meta = document.createElement('div');
-  meta.className = 'meta';
-  meta.innerHTML = `<span class="who">${who}</span><span class="time">${nowTime()}</span>`;
-  wrap.appendChild(meta);
-  thread.appendChild(wrap);
-  thread.scrollTop = thread.scrollHeight;
+const EVT = {
+  JOIN: 'chat.join',
+  LEAVE: 'chat.leave',
+  SEND: 'chat.send',
+  MESSAGE: 'chat.message',
 }
 
-function appendAttachmentBubble({ threadId, who, att, mine }) {
-  const thread = document.getElementById(threadId); if (!thread) return;
-  const wrap = document.createElement('div'); wrap.className = `msg ${mine?'me':'other'}`;
-  const tile = document.createElement('div'); tile.className = 'att-tile';
-  if ((att.mime||'').startsWith('image/')) {
-    const img = document.createElement('img'); img.src = att.url; img.alt = att.name; img.style.maxWidth='240px'; img.style.borderRadius='10px';
-    tile.appendChild(img); const name = document.createElement('div'); name.className='att-file'; name.textContent=`${att.name} • ${sizeStr(att.size||0)}`; tile.appendChild(name);
-  } else if ((att.mime||'').startsWith('video/')) {
-    const v=document.createElement('video'); v.src=att.url; v.controls=true; v.style.maxWidth='260px'; tile.appendChild(v);
-    const name=document.createElement('div'); name.className='att-file'; name.textContent=`${att.name} • ${sizeStr(att.size||0)}`; tile.appendChild(name);
-  } else if ((att.mime||'').startsWith('audio/')) {
-    const a=document.createElement('audio'); a.src=att.url; a.controls=true; tile.appendChild(a);
-    const name=document.createElement('div'); name.className='att-file'; name.textContent=`${att.name} • ${sizeStr(att.size||0)}`; tile.appendChild(name);
-  } else if ((att.mime||'')==='application/pdf') {
-    const link=document.createElement('a'); link.href=att.url; link.target='_blank'; link.textContent=`📄 ${att.name}`; link.className='att-link'; tile.appendChild(link);
-    const name=document.createElement('div'); name.className='att-file'; name.textContent=`${sizeStr(att.size||0)}`; tile.appendChild(name);
-  } else {
-    const link=document.createElement('a'); link.href=att.url; link.target='_blank'; link.download=att.name; link.textContent=`⬇️ ${att.name}`; link.className='att-link'; tile.appendChild(link);
-    const name=document.createElement('div'); name.className='att-file'; name.textContent=`${att.mime||'file'} • ${sizeStr(att.size||0)}`; tile.appendChild(name);
-  }
-  const meta=document.createElement('div'); meta.className='meta'; meta.innerHTML=`<span class="who">${who}</span><span class="time">${nowTime()}</span>`;
-  wrap.appendChild(tile); wrap.appendChild(meta); thread.appendChild(wrap); thread.scrollTop = thread.scrollHeight;
-}
-
-function log(box, ...args) {
-  const el = $(box); const line=document.createElement('div');
-  line.textContent = `[${nowTime()}] ` + args.map(ensureString).join(' ');
-  el.appendChild(line); el.scrollTop=el.scrollHeight;
-}
-
-function flashButton(id){
-  const el=$(id); if (!el) return; const old=el.style.boxShadow;
-  el.style.boxShadow='0 0 0 2px rgba(239,68,68,.8)'; setTimeout(()=>{ el.style.boxShadow=old; },600);
-}
-
-// ===== state =====
 const state = {
+  socket: null,
+  connected: false,
   serverUrl: '',
   wsPath: '/ws',
-  rooms: [], // {id,name,createdAt}
-  // per-side socket + membership + activeRoom + files
-  A: { socket:null, joined:new Set(), activeRoom:null, files:[], label:'A' },
-  B: { socket:null, joined:new Set(), activeRoom:null, files:[], label:'B' },
-  C: { socket:null, joined:new Set(), activeRoom:null, files:[], label:'C' },
-  D: { socket:null, joined:new Set(), activeRoom:null, files:[], label:'D' },
-  typingNamesByRoom: new Map(), // conversationId -> Set(names)
-};
-// dedupe trackers
-const sentLocal = new Map(); // clientId -> { side, conversationId }
-const lastLocalEcho = { A:null, B:null, C:null, D:null };
-
-function currentServer(){ return state.serverUrl || window.location.origin; }
-function updatePresence(){
-  const fmt = (s)=> (s.socket && s.joined.size>0) ? `✅ ${s.joined.size} room(s)` : (s.socket ? 'connected' : '—');
-  $('presence').textContent = `A: ${fmt(state.A)} | B: ${fmt(state.B)} | C: ${fmt(state.C)} | D: ${fmt(state.D)}`;
-}
-function nameForSide(side){ return side; }
-
-// ===== Room list UI =====
-function updateRoomListUI(){
-  const box = $('roomList');
-  box.innerHTML = '';
-  state.rooms.forEach(r=>{
-    const row = document.createElement('div');
-    row.className = 'row';
-    row.style.justifyContent = 'space-between';
-    row.style.margin = '4px 0';
-    const label = document.createElement('div');
-    label.innerHTML = `<span class="small">${r.name ? `<b>${r.name}</b> ` : ''}<code>${r.id}</code></span>`;
-    const actions = document.createElement('div');
-    SIDES.forEach(side=>{
-      const joined = state[side].joined.has(r.id);
-      const btn = document.createElement('button');
-      btn.className = 'ghost small';
-      btn.textContent = joined ? `Leave ${side}` : `Join ${side}`;
-      btn.onclick = () => toggleJoin(side, r.id); // immediate toggle
-      actions.appendChild(btn);
-    });
-    row.appendChild(label); row.appendChild(actions);
-    box.appendChild(row);
-  });
-  updateActiveRoomSelects();
+  sectionConversations: SECTIONS.reduce((acc, section) => {
+    acc[section.id] = null
+    return acc
+  }, {}),
+  conversationToSection: new Map(),
 }
 
-function updateActiveRoomSelects(){
-  SIDES.forEach(side=>{
-    const sel = $('activeRoom'+side);
-    if (!sel) return;
-    sel.innerHTML = '';
-    const joinedList = [...state[side].joined];
-    if (joinedList.length === 0) {
-      const opt=document.createElement('option'); opt.value=''; opt.textContent='(join a room)'; sel.appendChild(opt);
-      state[side].activeRoom = null;
-    } else {
-      joinedList.forEach(id=>{
-        const opt=document.createElement('option'); opt.value=id;
-        const meta = state.rooms.find(r=>r.id===id);
-        opt.textContent = meta?.name ? `${meta.name} (${id})` : id;
-        sel.appendChild(opt);
-      });
-      if (!state[side].activeRoom || !state[side].joined.has(state[side].activeRoom)) {
-        state[side].activeRoom = joinedList[0];
-      }
-      sel.value = state[side].activeRoom || '';
-    }
-  });
-  refreshActiveLabels();
-  updateRoomControls();
+const refs = {}
+const sentLocal = new Map()
+
+const logEl = document.getElementById('activityLog')
+const statusEl = document.getElementById('wsStatus')
+const clearAssignmentsBtn = document.getElementById('clearAssignments')
+const connectBtn = document.getElementById('connect')
+const disconnectBtn = document.getElementById('disconnect')
+
+function $(id) {
+  return document.getElementById(id)
 }
 
-function updateRoomControls() {
-  SIDES.forEach(side => {
-    const btn = $('send' + side);
-    if (!btn) return;
-    const ok = !!(state[side].socket && state[side].activeRoom && state[side].joined.has(state[side].activeRoom));
-    btn.disabled = !ok;
-  });
+function nowTime() {
+  return new Date().toLocaleTimeString()
 }
 
-function refreshActiveLabels(){
-  SIDES.forEach(side=>{
-    const lab = $('activeLabel'+side);
-    const id = state[side].activeRoom;
-    const meta = state.rooms.find(r=>r.id===id);
-    if (lab) lab.textContent = id ? (meta?.name ? `${meta.name} (${id})` : id) : '(no room selected)';
-  });
+function ensureString(value) {
+  if (typeof value === 'string') return value
+  if (value && typeof value.toString === 'function') return value.toString()
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
 }
 
-// ===== per-user chat boxes =====
-function renderUserBoxes() {
-  const grid = $('roomsGrid'); grid.innerHTML = '';
-  SIDES.forEach(side=>{
-    const wrap = document.createElement('div'); wrap.className='room';
-    wrap.innerHTML = `
-      <div class="room-head">
-        <div class="row" style="gap:6px">
-          <span class="badge">User ${side}</span>
-          <span class="muted small" id="activeLabel${side}"></span>
+function log(...args) {
+  if (!logEl) return
+  const line = document.createElement('div')
+  line.textContent = `[${nowTime()}] ${args.map(ensureString).join(' ')}`
+  logEl.appendChild(line)
+  logEl.scrollTop = logEl.scrollHeight
+}
+
+function mkClientId() {
+  return `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+function base64Decode(b64) {
+  try {
+    return decodeURIComponent(
+      escape(atob(String(b64).replace(/^BASE64:/, ''))),
+    )
+  } catch {
+    return b64
+  }
+}
+
+function formatTimestamp(value) {
+  if (!value) return ''
+  const when = new Date(value)
+  if (Number.isNaN(when.getTime())) return value
+  return when.toLocaleTimeString()
+}
+
+function clearThread(sectionId) {
+  const thread = refs[sectionId]?.thread
+  if (thread) thread.innerHTML = ''
+}
+
+function appendComment(sectionId, { author, text, createdAt, mine }) {
+  if (!text) return
+  const thread = refs[sectionId]?.thread
+  if (!thread) return
+
+  const comment = document.createElement('div')
+  comment.className = `comment${mine ? ' mine' : ''}`
+
+  const avatar = document.createElement('div')
+  avatar.className = 'comment-avatar'
+  avatar.textContent = (author || '•').slice(0, 2).toUpperCase()
+
+  const body = document.createElement('div')
+  body.className = 'comment-body'
+
+  const authorLine = document.createElement('div')
+  authorLine.className = 'comment-author'
+  const nameSpan = document.createElement('span')
+  nameSpan.textContent = author || 'Unknown'
+  const timeSpan = document.createElement('span')
+  timeSpan.textContent = formatTimestamp(createdAt) || nowTime()
+  authorLine.appendChild(nameSpan)
+  authorLine.appendChild(timeSpan)
+
+  const textEl = document.createElement('div')
+  textEl.className = 'comment-text'
+  textEl.textContent = text
+
+  body.appendChild(authorLine)
+  body.appendChild(textEl)
+  comment.appendChild(avatar)
+  comment.appendChild(body)
+  thread.appendChild(comment)
+  thread.scrollTop = thread.scrollHeight
+}
+
+function renderSections() {
+  const grid = document.getElementById('feedGrid')
+  if (!grid) return
+
+  SECTIONS.forEach((section) => {
+    const card = document.createElement('article')
+    card.className = 'feed-card'
+    card.innerHTML = `
+      <div class="feed-card-head">
+        <div>
+          <h3>${section.title}</h3>
+          <p class="feed-meta">${section.description}</p>
         </div>
+        <span class="section-id" id="section-${section.id}-label">(no conversation)</span>
       </div>
-      <div id="thread${side}" class="thread"></div>
-      <div id="typing${side}" class="typing"></div>
+      <div class="row">
+        <input class="conversation-input" placeholder="Conversation ID" />
+        <button class="primary small assign-button" data-section="${section.id}">Track</button>
+      </div>
+      <div class="feed-thread" id="thread-${section.id}"></div>
+      <div class="row" style="justify-content:flex-start">
+        <span class="status-pill" id="status-${section.id}">waiting for connection</span>
+      </div>
       <div class="composer">
-        <input id="composer${side}" placeholder="Type as ${side}…" style="flex:1" />
-        <input id="file${side}" type="file" multiple style="max-width:240px" />
-        <button id="send${side}" class="primary" disabled>Send</button>
+        <input id="composer-${section.id}" placeholder="Share your thought…" />
+        <button id="send-${section.id}" class="primary" disabled>Comment</button>
       </div>
-    `;
-    grid.appendChild(wrap);
+    `
+    grid.appendChild(card)
 
-    $('file'+side).addEventListener('change', (e)=> { state[side].files = [...e.target.files]; });
-    $('send'+side).onclick = async () => {
-      const text = $('composer'+side).value.trim();
-      await sendWithFilesPerSide(side, text);
-    };
+    const conversationInput = card.querySelector('.conversation-input')
+    const assignBtn = card.querySelector(`.assign-button[data-section="${section.id}"]`)
 
-    // typing
-    let tmr;
-    $('composer'+side).addEventListener('input', ()=>{
-      const s = state[side].socket, conversationId = state[side].activeRoom;
-      if (!s || !conversationId || !state[side].joined.has(conversationId)) return;
-      const who = nameForSide(side);
-      if (!state.typingNamesByRoom.has(conversationId)) state.typingNamesByRoom.set(conversationId, new Set());
-      state.typingNamesByRoom.get(conversationId).add(who);
-      renderTypingForRoom(conversationId);
-      s.emit('typing', { conversationId, isTyping:true, senderName: who });
-      clearTimeout(tmr);
-      tmr = setTimeout(()=>{
-        s.emit('typing', { conversationId, isTyping:false, senderName: who });
-        state.typingNamesByRoom.get(conversationId)?.delete(who);
-        renderTypingForRoom(conversationId);
-      }, 1000);
-    });
-  });
-  updateRoomControls();
-  refreshActiveLabels();
-}
-
-function renderTypingForRoom(conversationId){
-  const set = state.typingNamesByRoom.get(conversationId) || new Set();
-  const names = [...set];
-  SIDES.forEach(side=>{
-    const el = $('typing'+side);
-    if (!el) return;
-    const show = state[side].joined.has(conversationId) && state[side].activeRoom === conversationId;
-    el.textContent = show && names.length ? `${names.join(', ')} typing…` : '';
-  });
-}
-
-// ===== server controls =====
-$('serverUrl').value = '';
-$('wsPath').value = '/ws';
-
-$('applyServer').onclick = () => {
-  state.serverUrl = $('serverUrl').value.trim();
-  state.wsPath = $('wsPath').value.trim() || '/ws';
-  log('logs', 'Applied →', currentServer(), 'path:', state.wsPath);
-};
-
-// ===== uploads =====
-async function uploadLocalFile(file) {
-  const fd = new FormData(); fd.append('file', file);
-  const res = await fetch('/uploads/file', { method:'POST', body: fd });
-  const json = await res.json();
-  if (!json.ok) throw new Error(json.error || 'upload failed');
-  return json.attachment;
-}
-
-// ===== send per side & room (with dedupe) =====
-async function sendWithFilesPerSide(side, text) {
-  const s = state[side].socket; const conversationId = state[side].activeRoom;
-  if (!s) { log(sideLogBox(side), '❗ Not connected.'); flashButton('connect'+side); return; }
-  if (!conversationId) { log(sideLogBox(side), '❗ No active room. Join and select one.'); return; }
-  if (!state[side].joined.has(conversationId)) { log(sideLogBox(side), `❗ Not joined to room ${conversationId}.`); return; }
-
-  const files = state[side].files || [];
-  const attachments = [];
-  for (const f of files) {
-    try { attachments.push(await uploadLocalFile(f)); } catch (e) { log(sideLogBox(side), 'upload error:', String(e)); }
-  }
-
-  const clientId = mkClientId();
-  const payload = {
-    clientId,
-    conversationId,
-    senderName: side,
-    ciphertext: text ? btoa(unescape(encodeURIComponent(text))) : undefined,
-    attachments,
-  };
-  if (!payload.ciphertext && (!attachments || attachments.length === 0)) return;
-
-  // local echo (sender’s box)
-  if (text) appendBubble({ threadId:`thread${side}`, who: side, text, mine: true });
-  attachments.forEach(att=> appendAttachmentBubble({ threadId:`thread${side}`, who: side, att, mine:true }));
-
-  // track dedupe
-  sentLocal.set(clientId, { side, conversationId });
-  const chash = payload.ciphertext ? hashStr(payload.ciphertext) : 'att:' + attachments.map(a=>a.id||a.url).join(',');
-  lastLocalEcho[side] = { t: Date.now(), conversationId, chash };
-  setTimeout(()=>{ sentLocal.delete(clientId); }, 60_000);
-
-  s.emit('chat.send', payload, (ack)=> {
-    if (!ack || ack.ok === false) {
-      log(sideLogBox(side), '❗ chat.send rejected:', ack?.error || 'unknown');
-    } else {
-      log(sideLogBox(side), 'chat.send → ok id=', ack.id);
+    refs[section.id] = {
+      thread: document.getElementById(`thread-${section.id}`),
+      conversationInput,
+      composer: document.getElementById(`composer-${section.id}`),
+      sendBtn: document.getElementById(`send-${section.id}`),
+      label: document.getElementById(`section-${section.id}-label`),
+      status: document.getElementById(`status-${section.id}`),
     }
-  });
 
-  // clear
-  $('composer'+side).value = ''; const fi=$('file'+side); if (fi) fi.value='';
-  state[side].files = [];
-  s.emit('typing', { conversationId, isTyping:false, senderName: side });
-  state.typingNamesByRoom.get(conversationId)?.delete(side);
-  renderTypingForRoom(conversationId);
+    if (conversationInput && assignBtn) {
+      assignBtn.addEventListener('click', () => assignConversation(section.id))
+      conversationInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault()
+          assignConversation(section.id)
+        }
+      })
+    }
+
+    const composer = refs[section.id].composer
+    const sendBtn = refs[section.id].sendBtn
+    if (composer && sendBtn) {
+      composer.addEventListener('input', () => updateComposerState(section.id))
+      composer.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+          event.preventDefault()
+          sendComment(section.id)
+        }
+      })
+      sendBtn.addEventListener('click', () => sendComment(section.id))
+    }
+
+    updateComposerState(section.id)
+  })
 }
 
-// ===== sockets per side =====
-function wireSocket(side, token, statusId, logBox, disconnectBtnId) {
-  const s = io(currentServer(), { path: state.wsPath, auth:{ token }, transports:['websocket','polling'] });
-
-  s.on('connect', ()=>{
-    $(statusId).innerHTML = `<span class="ok small">connected</span> <span class="muted small">(${s.id})</span>`;
-    $(disconnectBtnId).disabled = false;
-    log(logBox, 'connected', s.id);
-    s.emit('room.list');
-  });
-
-  s.on('connect_error', (err)=>{ $(statusId).innerHTML=`<span class="err small">connect_error</span>`; log(logBox, 'connect_error', err?.message||err); });
-  s.on('disconnect', (reason)=>{ $(statusId).innerHTML=`<span class="muted small">disconnected (${reason})</span>`; state[side].joined.clear(); state[side].activeRoom=null; updatePresence(); updateActiveRoomSelects(); updateRoomControls(); log(logBox,'disconnected',reason); });
-
-  // rooms list updates
-  s.on('rooms.update', (list)=> {
-    state.rooms = list || [];
-    updateRoomListUI();
-  });
-
-  // creator ack
-  s.on('room.created', (r)=> {
-    log(logBox, 'room.created ←', r);
-    // mark joined (creator auto-joined on server)
-    state[side].joined.add(r.id);
-    if (!state[side].activeRoom) state[side].activeRoom = r.id;
-    updatePresence(); updateActiveRoomSelects(); updateRoomControls(); refreshActiveLabels();
-  });
-
-  // joined/left ack (optional UI)
-  s.on('chat.joined', ({ conversationId })=>{
-    log(logBox, 'chat.joined ←', conversationId);
-  });
-  s.on('chat.left', ({ conversationId })=>{
-    log(logBox, 'chat.left ←', conversationId);
-  });
-
-  // incoming messages
-  s.on('chat.message', (m)=>{
-    const conversationId = m?.conversationId;
-    const text =
-      (m && typeof m.text === 'string' && m.text) ||
-      (m && typeof m.message === 'string' && m.message) ||
-      (m && typeof m.ciphertext === 'string' && base64Decode(m.ciphertext)) ||
-      null;
-    const sender = (m && (m.senderName||m.sender||m.user||m.from||m.who||m.senderId)) || 'Someone';
-    const cid = m?.clientId;
-
-    const incomingHash = m?.ciphertext
-      ? hashStr(m.ciphertext)
-      : (Array.isArray(m?.attachments) && m.attachments.length
-          ? 'att:' + m.attachments.map(a=>a.id||a.url).join(',')
-          : '');
-
-    SIDES.forEach((sideX)=>{
-      // only render if user joined this conversation
-      if (!state[sideX].joined.has(conversationId)) return;
-
-      const mine = (sender === sideX);
-      // de-dupe
-      let skip=false;
-      if (cid) {
-        const rec = sentLocal.get(cid);
-        if (rec && rec.side===sideX && rec.conversationId===conversationId) skip=true;
-      } else if (mine && lastLocalEcho[sideX] && lastLocalEcho[sideX].conversationId===conversationId) {
-        const age = Date.now()-lastLocalEcho[sideX].t;
-        if (age<2000 && lastLocalEcho[sideX].chash && incomingHash && lastLocalEcho[sideX].chash===incomingHash) skip=true;
-      }
-      if (skip) return;
-
-      if (text) appendBubble({ threadId:`thread${sideX}`, who: sender, text, mine });
-      (m.attachments||[]).forEach(att=> appendAttachmentBubble({ threadId:`thread${sideX}`, who: sender, att, mine }));
-    });
-
-    log('logs', 'chat.message ←', { conversationId, sender, cid });
-  });
-
-  // typing
-  s.on('typing', (t)=>{
-    const conversationId = t?.conversationId; const who = t?.senderName||'Someone';
-    const isTyping = !!t?.isTyping;
-    if (!conversationId) return;
-
-    if (!state.typingNamesByRoom.has(conversationId)) state.typingNamesByRoom.set(conversationId, new Set());
-    const set = state.typingNamesByRoom.get(conversationId);
-    if (isTyping) set.add(who); else set.delete(who);
-    renderTypingForRoom(conversationId);
-  });
-
-  state[side].socket = s;
+function updateComposerState(sectionId) {
+  const composer = refs[sectionId]?.composer
+  const sendBtn = refs[sectionId]?.sendBtn
+  const hasConversation = Boolean(state.sectionConversations[sectionId])
+  const connected = state.connected
+  if (!composer || !sendBtn) return
+  const hasText = composer.value.trim().length > 0
+  sendBtn.disabled = !(connected && hasConversation && hasText)
+  composer.disabled = !connected
 }
 
-function toggleJoin(side, conversationId){
-  const s = state[side].socket;
-  if (!s) { log(sideLogBox(side), '❗ Not connected.'); flashButton('connect'+side); return; }
-  const isJoined = state[side].joined.has(conversationId);
+function updateAllComposerStates() {
+  SECTIONS.forEach((section) => updateComposerState(section.id))
+}
 
-  if (isJoined) {
-    // optimistic UI
-    state[side].joined.delete(conversationId);
-    if (state[side].activeRoom === conversationId) state[side].activeRoom = null;
-    s.emit('chat.leave', { conversationId }, (ack)=>{ log(sideLogBox(side), 'chat.leave ack:', ack); });
+function updateSectionStatus(sectionId, text, tone = 'normal') {
+  const status = refs[sectionId]?.status
+  if (!status) return
+  status.textContent = text
+  status.classList.toggle('active', tone === 'active')
+  status.classList.toggle('error', tone === 'error')
+}
+
+function assignConversation(sectionId) {
+  const input = refs[sectionId]?.conversationInput
+  const value = input?.value.trim()
+  if (!value) {
+    log(`Please provide a conversation ID for ${sectionId}.`)
+    return
+  }
+  setConversation(sectionId, value)
+}
+
+function setConversation(sectionId, conversationId) {
+  const current = state.sectionConversations[sectionId]
+  if (current && current !== conversationId) {
+    leaveConversation(current, sectionId)
+  }
+  if (conversationId) {
+    state.sectionConversations[sectionId] = conversationId
+    state.conversationToSection.set(conversationId, sectionId)
+    refs[sectionId]?.label?.textContent = conversationId
+    refs[sectionId]?.conversationInput?.value = ''
+    updateSectionStatus(
+      sectionId,
+      state.connected ? 'tracking comments' : 'queued (connect to join)',
+      'active',
+    )
+    clearThread(sectionId)
+    if (state.connected) {
+      joinConversation(conversationId, sectionId)
+    }
   } else {
-    // optimistic UI
-    state[side].joined.add(conversationId);
-    if (!state[side].activeRoom) state[side].activeRoom = conversationId;
-    s.emit('chat.join', { conversationId }, (ack)=>{ log(sideLogBox(side), 'chat.join ack:', ack); });
+    state.sectionConversations[sectionId] = null
+    updateSectionStatus(sectionId, 'cleared')
+    refs[sectionId]?.label?.textContent = '(no conversation)'
+    refs[sectionId]?.conversationInput?.value = ''
+    clearThread(sectionId)
   }
-
-  updatePresence(); updateActiveRoomSelects(); updateRoomControls(); refreshActiveLabels(); updateRoomListUI();
+  updateComposerState(sectionId)
 }
 
-// ===== UI wiring =====
-$('serverUrl').value = '';
-$('wsPath').value = '/ws';
-
-$('createRoom').onclick = ()=>{
-  const side = SIDES.find(s=>!!state[s].socket) || 'A';
-  const s = state[side].socket; if (!s) { log('logs', '❗ No connected users to create a room.'); return; }
-  const roomId = $('newRoomId').value.trim() || undefined;
-  const name = $('newRoomName').value.trim() || undefined;
-  s.emit('room.create', { roomId, name });
-  $('newRoomId').value=''; $('newRoomName').value='';
-};
-
-$('refreshRooms').onclick = ()=>{
-  const side = SIDES.find(s=>!!state[s].socket);
-  if (!side) { log('logs', '❗ No connected users to refresh.'); return; }
-  state[side].socket.emit('room.list');
-};
-
-// connect & disconnect
-$('connectA').onclick = ()=> wireSocket('A', $('tokenA').value.trim(), 'statusA', 'logsA', 'disconnectA');
-$('connectB').onclick = ()=> wireSocket('B', $('tokenB').value.trim(), 'statusB', 'logsB', 'disconnectB');
-$('connectC').onclick = ()=> wireSocket('C', $('tokenC').value.trim(), 'statusC', 'logsC', 'disconnectC');
-$('connectD').onclick = ()=> wireSocket('D', $('tokenD').value.trim(), 'statusD', 'logsD', 'disconnectD');
-
-$('disconnectA').onclick = ()=> { try{ state.A.socket?.disconnect(); }catch{} state.A.socket=null; state.A.joined.clear(); state.A.activeRoom=null; updatePresence(); updateActiveRoomSelects(); updateRoomControls(); };
-$('disconnectB').onclick = ()=> { try{ state.B.socket?.disconnect(); }catch{} state.B.socket=null; state.B.joined.clear(); state.B.activeRoom=null; updatePresence(); updateActiveRoomSelects(); updateRoomControls(); };
-$('disconnectC').onclick = ()=> { try{ state.C.socket?.disconnect(); }catch{} state.C.socket=null; state.C.joined.clear(); state.C.activeRoom=null; updatePresence(); updateActiveRoomSelects(); updateRoomControls(); };
-$('disconnectD').onclick = ()=> { try{ state.D.socket?.disconnect(); }catch{} state.D.socket=null; state.D.joined.clear(); state.D.activeRoom=null; updatePresence(); updateActiveRoomSelects(); updateRoomControls(); };
-
-// Active room selectors (per side)
-SIDES.forEach(side=>{
-  document.addEventListener('change', (e)=>{
-    const sel = $('activeRoom'+side);
-    if (e.target === sel) {
-      state[side].activeRoom = sel.value || null;
-      updateRoomControls(); refreshActiveLabels();
+function joinConversation(conversationId, sectionId) {
+  if (!state.socket) return
+  state.socket.emit(EVT.JOIN, { conversationId }, (ack) => {
+    if (ack?.ok) {
+      log(`Joined ${conversationId} for ${sectionId}`)
+      updateSectionStatus(sectionId, 'tracking comments', 'active')
+    } else {
+      const message = ack?.error || 'join failed'
+      log(`Unable to join ${conversationId}: ${message}`)
+      updateSectionStatus(sectionId, message, 'error')
     }
-  });
-});
+  })
+}
 
-// initial render
-renderUserBoxes();
-updatePresence();
+function leaveConversation(conversationId, sectionId) {
+  if (!conversationId || !state.socket) return
+  state.socket.emit(EVT.LEAVE, { conversationId }, (ack) => {
+    log(`Left ${conversationId} (${ensureString(ack)})`)
+  })
+  state.conversationToSection.delete(conversationId)
+}
+
+function sendComment(sectionId) {
+  const conversationId = state.sectionConversations[sectionId]
+  const composer = refs[sectionId]?.composer
+  if (!state.socket || !state.connected || !conversationId || !composer) {
+    log('Cannot send comment; ensure you are connected and tracking a conversation.')
+    return
+  }
+  const text = composer.value.trim()
+  if (!text) return
+
+  const clientId = mkClientId()
+  appendComment(sectionId, {
+    author: 'You',
+    text,
+    createdAt: new Date().toISOString(),
+    mine: true,
+  })
+  composer.value = ''
+  updateComposerState(sectionId)
+
+  sentLocal.set(clientId, { sectionId, conversationId })
+  setTimeout(() => sentLocal.delete(clientId), 60_000)
+
+  const payload = {
+    conversationId,
+    clientId,
+    kind: 'text',
+    text,
+  }
+
+  state.socket.emit(EVT.SEND, payload, (ack) => {
+    log('chat.send ack', ack)
+  })
+}
+
+function handleIncomingMessage(message) {
+  const conversationId = message?.conversationId
+  if (!conversationId) return
+  const sectionId = state.conversationToSection.get(conversationId)
+  if (!sectionId) return
+
+  const cid = message?.clientId
+  if (cid) {
+    const record = sentLocal.get(cid)
+    if (record && record.sectionId === sectionId && record.conversationId === conversationId) {
+      sentLocal.delete(cid)
+      return
+    }
+  }
+
+  const sender =
+    message?.senderName ||
+    message?.sender ||
+    message?.user ||
+    message?.from ||
+    'Someone'
+  const text =
+    (typeof message?.text === 'string' && message.text) ||
+    (typeof message?.message === 'string' && message.message) ||
+    (typeof message?.ciphertext === 'string' && base64Decode(message.ciphertext)) ||
+    ''
+
+  appendComment(sectionId, {
+    author: sender,
+    text,
+    createdAt: message?.createdAt,
+    mine: false,
+  })
+}
+
+function wireSocket() {
+  const base = $('serverUrl')?.value.trim() || ''
+  const path = $('wsPath')?.value.trim() || '/ws'
+  const token = $('authToken')?.value.trim()
+  const url = base || window.location.origin
+
+  state.serverUrl = url
+  state.wsPath = path
+
+  if (state.socket) {
+    state.socket.disconnect()
+  }
+
+  log(`Connecting to ${url}${path}`)
+  connectBtn.disabled = true
+  updateConnectionStatus('connecting…', false)
+
+  const opts = { path, transports: ['websocket', 'polling'] }
+  if (token) opts.auth = { token }
+  const socket = io(url, opts)
+  state.socket = socket
+
+  socket.on('connect', () => {
+    state.connected = true
+    updateConnectionStatus('connected', true)
+    disconnectBtn.disabled = false
+    log('Socket connected', socket.id)
+    SECTIONS.forEach((section) => {
+      const convo = state.sectionConversations[section.id]
+      if (convo) joinConversation(convo, section.id)
+    })
+    updateAllComposerStates()
+  })
+
+  socket.on('disconnect', (reason) => {
+    state.connected = false
+    updateConnectionStatus(`disconnected (${reason})`, false)
+    disconnectBtn.disabled = true
+    connectBtn.disabled = false
+    log('Socket disconnected', reason)
+    updateAllComposerStates()
+  })
+
+  socket.on('connect_error', (err) => {
+    state.connected = false
+    updateConnectionStatus('connect error', false)
+    connectBtn.disabled = false
+    disconnectBtn.disabled = true
+    log('connect_error', err?.message || err)
+  })
+
+  socket.on('chat.ready', (payload) => {
+    log('chat.ready', payload)
+  })
+
+  socket.on(EVT.MESSAGE, (payload) => {
+    handleIncomingMessage(payload)
+  })
+}
+
+function updateConnectionStatus(text, online) {
+  if (!statusEl) return
+  statusEl.textContent = text
+  if (online) {
+    statusEl.classList.add('active')
+    statusEl.classList.remove('error')
+  } else {
+    statusEl.classList.remove('active')
+  }
+}
+
+function tearDownSocket() {
+  if (!state.socket) return
+  log('Disconnect requested')
+  state.socket.disconnect()
+  state.socket = null
+  state.connected = false
+  updateConnectionStatus('disconnected', false)
+  disconnectBtn.disabled = true
+  connectBtn.disabled = false
+  updateAllComposerStates()
+}
+
+function resetAssignments() {
+  SECTIONS.forEach((section) => setConversation(section.id, null))
+  log('Cleared all conversation assignments')
+}
+
+function init() {
+  if (!logEl || !statusEl || !connectBtn || !disconnectBtn) return
+  renderSections()
+  connectBtn.addEventListener('click', wireSocket)
+  disconnectBtn.addEventListener('click', tearDownSocket)
+  clearAssignmentsBtn?.addEventListener('click', resetAssignments)
+  updateAllComposerStates()
+  log('Ready to wire LinkedIn-style comments.')
+}
+
+init()

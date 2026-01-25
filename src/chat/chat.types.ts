@@ -38,6 +38,11 @@ export interface SocketPrincipal {
   token?: string
 }
 
+export const BROADCAST_CONVERSATION_PREFIX = 'broadcast:';
+
+export const isBroadcastConversation = (conversationId?: string | null) =>
+  typeof conversationId === 'string' && conversationId.startsWith(BROADCAST_CONVERSATION_PREFIX);
+
 /* =========================
  * Conversation Permissions
  * ========================= */
@@ -195,6 +200,14 @@ export interface SendMessagePayload {
   threadId?: string
   replyTo?: string
   ephemeral?: boolean
+
+  encrypted?: boolean
+  ciphertext?: string
+  iv?: string
+  tag?: string
+  encryptionVersion?: string
+  encryptionKeyVersion?: string
+  aad?: string
 }
 
 export interface EditMessagePayload {

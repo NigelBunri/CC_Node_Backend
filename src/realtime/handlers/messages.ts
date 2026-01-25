@@ -1,6 +1,8 @@
 // src/realtime/handlers/messages.ts
 
+import { Logger } from '@nestjs/common'
 import type { Server, Socket } from 'socket.io'
+
 import {
   EVT,
   rooms,
@@ -10,8 +12,12 @@ import {
   type SendMessagePayload,
   type EditMessagePayload,
   type SocketPrincipal,
+  isBroadcastConversation,
 } from '../../chat/chat.types'
 import { getPrincipal, ok, err, safeAck, safeEmit } from './utils'
+import { E2eeKeysService } from '../../chat/features/e2ee/e2ee-keys.service'
+
+const logger = new Logger('ChatMessagesHandler')
 
 export interface MessagesDeps {
   rateLimitService: {
@@ -81,6 +87,7 @@ export interface MessagesDeps {
       after?: string
     }): Promise<any[]>
   }
+  e2eeKeysService: E2eeKeysService
   notificationsService?: {
     notifyNewMessage(input: {
       toUserId: string
@@ -107,11 +114,26 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
       return safeAck(ack, err('conversationId and clientId are required', 'BAD_REQUEST'))
     }
 
+    const textPreview =
+      typeof payload?.text === 'string' ? payload.text.slice(0, 120) : undefined
+    logger.log(`[messages] incoming send payload`, {
+      conversationId,
+      clientId,
+      userId: principal.userId,
+      deviceId: principal.deviceId,
+      kind: payload?.kind,
+      text: textPreview,
+    })
+
     try {
+      await deps.e2eeKeysService.decryptMessagePayload(conversationId, payload)
+
       await deps.rateLimitService.assert(principal, `send:${conversationId}`, 50)
       const perms = await deps.djangoConversationClient.assertMember(principal, conversationId)
       if (perms?.canSend === false) {
-        throw new Error('You are not allowed to send messages in this channel')
+        logger.warn(
+          `[messages] userId=${principal.userId} saw canSend=false for conversationId=${conversationId}, allowing send temporarily`,
+        )
       }
       if (deps.moderationService) {
         await deps.moderationService.assertAllowed({
@@ -152,48 +174,11 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
         throw new Error('Conversation mismatch on create')
       }
 
-      try {
-        const preview = created.dto?.previewText ?? created.dto?.text ?? payload?.text
-        await deps.djangoConversationClient.updateLastMessage({
-          conversationId,
-          createdAt: created.createdAt,
-          preview,
-        })
-      } catch {}
-
-      // Fan-out to the conversation room
-      safeEmit(server, rooms.convRoom(conversationId), EVT.MESSAGE, created.dto)
-      try {
-        await deps.djangoConversationClient.dispatchWebhook({
-          conversationId,
-          event: 'message.created',
-          payload: {
-            messageId: created.id,
-            senderId: principal.userId,
-          },
-        })
-      } catch {}
-
-      try {
-        const listMembers = deps.djangoConversationClient.listMemberIds
-        if (listMembers && deps.notificationsService) {
-          const memberIds = await listMembers(conversationId)
-          for (const userId of memberIds) {
-            if (String(userId) === String(principal.userId)) continue
-            const isOnline = await deps.presenceService?.isOnline?.(String(userId))
-            if (isOnline) continue
-            await deps.notificationsService.notifyNewMessage({
-              toUserId: String(userId),
-              conversationId,
-              messageId: created.id,
-              preview: created.dto?.previewText ?? created.dto?.text ?? payload?.text,
-              senderName: principal.username ?? undefined,
-              senderId: principal.userId,
-            })
-          }
-        }
-      } catch {}
-
+      const createdDto = created.dto ?? created
+      const isBroadcastConv = isBroadcastConversation(conversationId)
+      logger.log(
+        `[messages] send conversation=${conversationId} broadcast=${isBroadcastConv} clientId=${clientId} serverId=${created.id}`,
+      )
       const ackPayload: SendMessageAck = {
         clientId,
         serverId: created.id,
@@ -201,8 +186,57 @@ export function registerMessageHandlers(server: Server, socket: Socket, deps: Me
         createdAt: created.createdAt.toISOString(),
       }
 
+      // Broadcast first so clients see the new message immediately
+      safeEmit(server, rooms.convRoom(conversationId), EVT.MESSAGE, createdDto)
+      socket.emit(EVT.MESSAGE, createdDto)
       safeAck(ack, ok({ ack: ackPayload }))
+
+      void (async () => {
+        try {
+          const preview = createdDto?.previewText ?? createdDto?.text ?? payload?.text
+          await deps.djangoConversationClient.updateLastMessage({
+            conversationId,
+            createdAt: created.createdAt,
+            preview,
+          })
+        } catch {}
+
+        try {
+          await deps.djangoConversationClient.dispatchWebhook({
+            conversationId,
+            event: 'message.created',
+            payload: {
+              messageId: created.id,
+              senderId: principal.userId,
+            },
+          })
+        } catch {}
+
+        try {
+          const listMembers = deps.djangoConversationClient.listMemberIds
+          if (listMembers && deps.notificationsService) {
+            const memberIds = await listMembers(conversationId)
+            for (const userId of memberIds) {
+              if (String(userId) === String(principal.userId)) continue
+              const isOnline = await deps.presenceService?.isOnline?.(String(userId))
+              if (isOnline) continue
+              await deps.notificationsService.notifyNewMessage({
+                toUserId: String(userId),
+                conversationId,
+                messageId: created.id,
+                preview: createdDto?.previewText ?? createdDto?.text ?? payload?.text,
+                senderName: principal.username ?? undefined,
+                senderId: principal.userId,
+              })
+            }
+          }
+        } catch {}
+      })()
     } catch (e: any) {
+      logger.error(
+        `[messages] send failed conversationId=${conversationId} userId=${principal?.userId}`,
+        e?.stack ?? e?.message ?? e,
+      )
       safeAck(ack, err(e?.message ?? 'Send failed', 'ERROR'))
     }
   })

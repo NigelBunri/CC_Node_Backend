@@ -3,7 +3,11 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common'
 import { HttpService } from '@nestjs/axios'
 import { firstValueFrom } from 'rxjs'
-import { SocketPrincipal, ConversationPermission } from '../../chat.types'
+import {
+  SocketPrincipal,
+  ConversationPermission,
+  isBroadcastConversation,
+} from '../../chat.types'
 
 export interface DjangoWsPermsResponse {
   isMember: boolean
@@ -55,6 +59,14 @@ export class DjangoConversationClient {
     if (cached && cached.expiresAt > now) {
       return cached.data
     }
+    if (isBroadcastConversation(conversationId)) {
+      const perms = this.buildBroadcastPerms()
+      this.permsCache.set(cacheKey, {
+        expiresAt: now + this.permsTtlMs,
+        data: perms,
+      })
+      return perms
+    }
     const url = process.env.DJANGO_CONV_PERMS_URL?.replace(
       '{conversationId}',
       conversationId,
@@ -99,6 +111,9 @@ export class DjangoConversationClient {
     principal: SocketPrincipal,
     conversationId: string,
   ): Promise<DjangoWsPermsResponse> {
+    if (isBroadcastConversation(conversationId)) {
+      return this.buildBroadcastPerms()
+    }
     const perms = await this.wsPerms(principal, conversationId)
 
     if (!perms.isMember) {
@@ -137,6 +152,9 @@ export class DjangoConversationClient {
   }
 
   async listMemberIds(conversationId: string): Promise<string[]> {
+    if (isBroadcastConversation(conversationId)) {
+      return []
+    }
     const base = process.env.DJANGO_API_URL
     const url =
       process.env.DJANGO_CONV_MEMBER_IDS_URL
@@ -162,6 +180,9 @@ export class DjangoConversationClient {
     action: 'send' | 'edit' | 'delete'
     text?: string
   }): Promise<DjangoPolicyCheckResponse> {
+    if (isBroadcastConversation(args.conversationId)) {
+      return { allowed: true }
+    }
     const base = process.env.DJANGO_API_URL
     const url =
       process.env.DJANGO_CONV_POLICY_CHECK_URL
@@ -214,5 +235,9 @@ export class DjangoConversationClient {
       ),
     )
     return res?.data ?? { delivered: 0 }
+  }
+
+  private buildBroadcastPerms(): DjangoWsPermsResponse {
+    return { isMember: true, isBlocked: false, canSend: true }
   }
 }

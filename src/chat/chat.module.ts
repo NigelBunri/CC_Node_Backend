@@ -6,14 +6,24 @@ import { HttpModule } from '@nestjs/axios' // ✅ required for HttpService
 
 import { AuthModule } from '../auth/auth.module'
 import { WsAuthGuard } from '../auth/ws-auth.guard'
+import { HttpAuthGuard } from '../auth/http-auth.guard'
 
 import { Message, MessageSchema } from './features/messages/schemas/message.schema'
+import {
+  ConversationKey,
+  ConversationKeySchema,
+} from './features/e2ee/schemas/conversation-key.schema'
+import {
+  BroadcastConversation,
+  BroadcastConversationSchema,
+} from './features/broadcasts/broadcast-conversation.schema'
 
 import { MessagesService } from './features/messages/messages.service'
 import { ReactionsService } from './features/reactions/reactions.service'
 import { ReceiptsService } from './features/receipts/receipts.service'
 import { SyncService } from './features/sync/sync.service'
 import { PresenceService } from './features/presence/presence.service'
+import { E2eeKeysService } from './features/e2ee/e2ee-keys.service'
 
 import { DjangoConversationClient } from './integrations/django/django-conversation.client'
 import { DjangoSeqClient } from './integrations/django/django-seq.client'
@@ -35,6 +45,9 @@ import { CallsModule } from './features/calls/calls.module'
 import { SearchModule } from './features/search/search.module'
 import { CallsController } from './features/calls/calls.controller'
 import { BroadcastsController } from './features/broadcasts/broadcasts.controller'
+import { BroadcastCommentsController } from './features/broadcasts/broadcast-comments.controller'
+import { BroadcastConversationsService } from './features/broadcasts/broadcast-conversation.service'
+import { E2eeController } from './features/e2ee/e2ee.controller'
 
 // ✅ Notifications
 import { NotificationsModule } from '../notifications/notifications.module'
@@ -50,7 +63,11 @@ import { CallStateModule } from './features/calls/call-state.module'
     HttpModule,
 
     // shared Message model
-    MongooseModule.forFeature([{ name: Message.name, schema: MessageSchema }]),
+    MongooseModule.forFeature([
+      { name: Message.name, schema: MessageSchema },
+      { name: ConversationKey.name, schema: ConversationKeySchema },
+      { name: BroadcastConversation.name, schema: BroadcastConversationSchema },
+    ]),
 
     ThreadsModule,
     PinsModule,
@@ -67,12 +84,15 @@ import { CallStateModule } from './features/calls/call-state.module'
     CallsController,
     PinsController,
     BroadcastsController,
+    BroadcastCommentsController,
+    E2eeController,
     RealtimeInternalController,
   ],
   providers: [
     ChatGateway,
     WsAuthGuard,
     InternalAuthGuard,
+    HttpAuthGuard,
 
     // Batch A services
     MessagesService,
@@ -80,11 +100,14 @@ import { CallStateModule } from './features/calls/call-state.module'
     ReceiptsService,
     SyncService,
     PresenceService,
+    BroadcastConversationsService,
 
     // Django integrations + infra
     DjangoConversationClient,
     DjangoSeqClient,
     RateLimitService,
+    E2eeKeysService,
   ],
+  exports: [ChatGateway],
 })
 export class ChatModule {}

@@ -15,6 +15,8 @@ import { UploadsModule } from './uploads/uploads.module';
 // ✅ Observability + health
 import { ObservabilityModule } from './observability/observability.module';
 import { HealthModule } from './health/health.module';
+import { BroadcastModule } from './broadcast.module';
+import { FeedsModule } from './feeds.module';
 
 @Module({
   imports: [
@@ -63,6 +65,8 @@ import { HealthModule } from './health/health.module';
     // ✅ cross-cutting
     ObservabilityModule,
     HealthModule,
+    BroadcastModule,
+    FeedsModule,
 
     // ✅ core
     ChatModule,

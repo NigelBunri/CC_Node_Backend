@@ -27,6 +27,7 @@ import { ModerationService } from '../chat/features/moderation/moderation.servic
 import { PresenceService } from '../chat/features/presence/presence.service'
 import { NotificationsService } from '../notifications/notifications.service'
 import { registerRealtimeHandlers } from './handlers'
+import { E2eeKeysService } from '../chat/features/e2ee/e2ee-keys.service'
 
 @WebSocketGateway({
   path: '/ws',
@@ -52,6 +53,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private readonly presenceService: PresenceService,
     private readonly notificationsService: NotificationsService,
     private readonly authService: DjangoAuthService,
+    private readonly e2eeKeysService: E2eeKeysService,
   ) {}
 
   async handleConnection(@ConnectedSocket() socket: Socket) {
@@ -76,27 +78,15 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
       if (!token) {
         this.logger.warn(`[WS] missing token, disconnecting socketId=${socket.id}`)
-        try {
-          socket.disconnect(true)
-        } catch {}
+        socket.disconnect(true)
         return
       }
 
-      try {
-        principal = await this.authService.introspect(token)
-        const deviceId =
-          (socket.handshake as any)?.auth?.deviceId ||
-          (socket.handshake?.headers as any)?.['x-device-id']
-        ;(socket as any).principal = { ...principal, token, deviceId }
-      } catch (e: any) {
-        this.logger.warn(
-          `[WS] invalid token, disconnecting socketId=${socket.id} reason=${e?.message ?? '-'}`,
-        )
-        try {
-          socket.disconnect(true)
-        } catch {}
-        return
-      }
+      principal = await this.authService.introspect(token)
+      const deviceId =
+        (socket.handshake as any)?.auth?.deviceId ||
+        (socket.handshake?.headers as any)?.['x-device-id']
+      ;(socket as any).principal = { ...principal, token, deviceId }
     }
 
     // --- Attach a debug "onAny" BEFORE registering handlers
@@ -109,9 +99,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     })
 
     // --- Join user room
-    try {
-      socket.join(rooms.userRoom(principal.userId))
-    } catch {}
+    socket.join(rooms.userRoom(principal.userId))
 
     // --- Register handlers immediately
     registerRealtimeHandlers(this.server, socket, {
@@ -126,15 +114,14 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       moderationService: this.moderationService,
       notificationsService: this.notificationsService,
       presenceService: this.presenceService,
+      e2eeKeysService: this.e2eeKeysService,
     })
 
     // --- Emit readiness
-    try {
-      socket.emit('chat.ready', { ok: true })
-    } catch {}
+    socket.emit('chat.ready', { ok: true })
 
     // --- Presence (do not await)
-    this.presenceService.markOnline(principal.userId).catch(() => {})
+    void this.presenceService.markOnline(principal.userId)
 
     this.logger.log(
       `[WS] connected socketId=${socket.id} userId=${principal.userId} deviceId=${principal.deviceId ?? '-'} ip=${socket.handshake.address ?? '-'} transport=${socket.conn.transport.name}`,
@@ -142,26 +129,22 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   async handleDisconnect(@ConnectedSocket() socket: Socket) {
-    try {
-      socket.removeAllListeners()
-    } catch {}
+    socket.removeAllListeners()
 
     const principal = (socket as any).principal as SocketPrincipal | undefined
 
     if (principal?.userId) {
-      await this.presenceService.markOffline(principal.userId).catch(() => {})
+      await this.presenceService.markOffline(principal.userId)
 
       for (const room of socket.rooms) {
         if (!room.startsWith('conv:')) continue
         const conversationId = room.slice('conv:'.length)
-        try {
-          this.server.to(room).emit(EVT.PRESENCE, {
-            conversationId,
-            userId: principal.userId,
-            isOnline: false,
-            at: new Date().toISOString(),
-          })
-        } catch {}
+        this.server.to(room).emit(EVT.PRESENCE, {
+          conversationId,
+          userId: principal.userId,
+          isOnline: false,
+          at: new Date().toISOString(),
+        })
       }
 
       this.logger.log(
